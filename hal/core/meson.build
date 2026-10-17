@@ -30,6 +30,15 @@ hal_core_sources = files(
 
 hal_core_inc = include_directories('.')
 
+# SYSMAN compatibility shim for older Level Zero loaders that do not export
+# a handful of SYSMAN entry points xpum uses. Off by default so that the real
+# implementations are used whenever the installed loader provides them.
+level_zero_sysman_compat = get_option('level_zero_sysman_compat')
+if level_zero_sysman_compat
+  message('Level Zero: enabling SYSMAN compatibility stubs')
+  hal_core_sources += files('level_zero_compat.c')
+endif
+
 # extensions-only sources (dev branch only)
 # These files are only included when building with -Dextensions=true
 extensions_enabled = get_option('extensions')

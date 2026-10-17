@@ -28,3 +28,5 @@ option('with_tests', type: 'boolean', value: false,
 
 option('extensions', type: 'boolean', value: false,
        description: 'Include extensions-only features (dev branch only)')
+option('level_zero_sysman_compat', type : 'boolean', value : false,
+       description : 'Provide stubs for SYSMAN APIs missing from older Level Zero loaders (zesDevicePciLinkSpeedUpdateExt, zesRasGetStateExp2, zesRasGetSupportedCategoriesExp). Enable when the installed loader cannot initialise the installed GPU driver, since a newer loader would fail zeInit() with ZE_RESULT_ERROR_UNSUPPORTED_VERSION. Leave disabled when the loader already exports these symbols.')
