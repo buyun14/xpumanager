@@ -23,6 +23,59 @@ metrics_registry_test = executable(
 
 test('metrics_registry_test', metrics_registry_test)
 
+smi_test = executable(
+  'smi_test',
+  'smi_test.cpp',
+  include_directories: [
+    global_inc,
+    ial_cmn_inc,
+  ],
+  link_with: ial_cmn_lib,
+  dependencies: ial_cmn_test_deps,
+  cpp_args: ial_cmn_cpp_args,
+  link_args: is_linux ? ['-pie'] : [],
+  build_by_default: true,
+  install: false,
+)
+
+test('smi_test', smi_test)
+
+frame_loop_test = executable(
+  'frame_loop_test',
+  'frame_loop_test.cpp',
+  include_directories: [
+    global_inc,
+    ial_cmn_inc,
+  ],
+  link_with: ial_cmn_lib,
+  dependencies: ial_cmn_test_deps,
+  cpp_args: ial_cmn_cpp_args,
+  link_args: is_linux ? ['-pie'] : [],
+  build_by_default: true,
+  install: false,
+)
+
+test('frame_loop_test', frame_loop_test)
+
+query_test = executable(
+  'query_test',
+  'query_test.cpp',
+  include_directories: [
+    global_inc,
+    ial_cmn_inc,
+  ],
+  link_with: ial_cmn_lib,
+  dependencies: ial_cmn_test_deps,
+  cpp_args: ial_cmn_cpp_args,
+  link_args: is_linux ? ['-pie'] : [],
+  build_by_default: true,
+  install: false,
+)
+
+test('query_test', query_test,
+  env: {'QUERY_DOCS': meson.project_source_root() / 'docs' / 'sphinx' / 'xpu-smi' / 'query.rst'},
+)
+
 discovery_test = executable(
   'discovery_test',
   'discovery_test.cpp',
@@ -37,6 +90,23 @@ discovery_test = executable(
 )
 
 test('discovery_test', discovery_test)
+
+version_report_test = executable(
+  'version_report_test',
+  'version_report_test.cpp',
+  include_directories: [
+    global_inc,
+    ial_cmn_inc,
+  ],
+  link_with: ial_cmn_lib,
+  dependencies: ial_cmn_test_deps,
+  cpp_args: ial_cmn_cpp_args,
+  link_args: is_linux ? ['-pie'] : [],
+  build_by_default: true,
+  install: false,
+)
+
+test('version_report_test', version_report_test)
 
 if is_linux
   topology_test = executable(
@@ -152,6 +222,23 @@ if is_linux
 
   test('offline_pages_test', offline_pages_test)
 
+  cmd_stats_fdinfo_test = executable(
+    'cmd_stats_fdinfo_test',
+    'cmd_stats_fdinfo_test.cpp',
+    include_directories: [
+      global_inc,
+      ial_cmn_inc,
+    ],
+    link_with: ial_cmn_lib,
+    dependencies: ial_cmn_test_deps,
+    cpp_args: ial_cmn_cpp_args,
+    link_args: ['-pie'],
+    build_by_default: true,
+    install: false,
+  )
+
+  test('cmd_stats_fdinfo_test', cmd_stats_fdinfo_test)
+
   crashlog_test = executable(
     'crashlog_test',
     'crashlog_test.cpp',
@@ -168,5 +255,22 @@ if is_linux
   )
 
   test('crashlog_test', crashlog_test)
+
+  config_test = executable(
+    'config_test',
+    'config_test.cpp',
+    include_directories: [
+      global_inc,
+      ial_cmn_inc,
+    ],
+    link_with: ial_cmn_lib,
+    dependencies: ial_cmn_test_deps,
+    cpp_args: ial_cmn_cpp_args,
+    link_args: ['-pie'],
+    build_by_default: true,
+    install: false,
+  )
+
+  test('config_test', config_test)
 
 endif

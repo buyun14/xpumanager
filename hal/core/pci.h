@@ -8,6 +8,7 @@
 #define PCI_H
 
 #include "sysman.h"
+#include <optional>
 #include <string>
 #include <osvf.h>
 
@@ -27,9 +28,43 @@ struct PciDowngradeState
 	zes_device_action_t pendingAction;
 };
 
+/** The device's largest memory BAR, through which the host reaches its local memory. */
+struct MemoryBar
+{
+	uint64_t size = 0;				 ///< Bytes
+	bool resizableSupported = false; ///< The device supports Resizable BAR
+	bool resizableEnabled = false;	 ///< Resizable BAR is enabled for this BAR
+};
+
+/** The result of pci::getMemoryBar(). */
+struct MemoryBarQuery
+{
+	ze_result_t status{};
+	std::optional<MemoryBar> bar; ///< Set when status is ZE_RESULT_SUCCESS
+};
+
+/**
+ * @brief Lets the pci::init() calls made while it lives share one list of the system's MEI devices.
+ *
+ * IGSC lists every MEI device of the system, about 300 ms with eight cards, and pci::init() runs
+ * once per device. Outside a scope every lookup lists them afresh, so a device read again later,
+ * e.g. after a reset that may renumber its MEI node, gets a current list. Scopes may nest.
+ */
+class LIBXPUM_API MeiDeviceListScope
+{
+public:
+	MeiDeviceListScope();
+	~MeiDeviceListScope();
+	MeiDeviceListScope(const MeiDeviceListScope &) = delete;
+	MeiDeviceListScope &operator=(const MeiDeviceListScope &) = delete;
+	MeiDeviceListScope(MeiDeviceListScope &&) = delete;
+	MeiDeviceListScope &operator=(MeiDeviceListScope &&) = delete;
+};
+
 class LIBXPUM_API pci : public sysman
 {
 private:
+	void adoptAddress(const zes_pci_address_t &address);
 	pci_addr_mei_device deviceProperties;
 	PciDowngradeState downgradeState;
 	// init() leaves these untouched when zesDevicePciGetProperties() fails, and callers
@@ -40,6 +75,11 @@ private:
 	uint32_t func = 0;
 	char bdfStr[BDF_STR_LEN] = {};
 	zes_driver_handle_t zesDriver = nullptr;
+	// The GSC query behind fwStatus and gfxFwVersion costs ~200 ms per device as root on some
+	// platforms, so it runs on the first call that needs either instead of in init().
+	bool gfxFirmwareQueried = false;
+	std::optional<std::string> gfxFwVersion;
+	void queryGfxFirmware();
 	typedef ze_result_t (*pfnZesIntelDevicePciLinkSpeedUpdateExp_t)(zes_device_handle_t hDevice, ze_bool_t bDowngrade,
 																	zes_device_action_t *pPendingAction);
 
@@ -47,8 +87,10 @@ public:
 	pci() : deviceProperties{}, downgradeState{} { deviceProperties.fwStatus = "unknown"; }
 	~pci() {}
 	ze_result_t init(zes_device_handle_t device);
+	void initFromAddress(const zes_pci_address_t &address);
 	ze_result_t getProperties(zes_device_handle_t device, zes_pci_properties_t *pciProperties);
 	ze_result_t getBars(zes_device_handle_t device);
+	[[nodiscard]] MemoryBarQuery getMemoryBar(zes_device_handle_t device);
 	ze_result_t getState(zes_device_handle_t device, zes_pci_link_status_t &pciLinkStatus);
 	ze_result_t getCurrentLinkSpeed(zes_device_handle_t device, zes_pci_speed_t &speed);
 	ze_result_t getStats(zes_device_handle_t device, zes_pci_stats_t *pciStats);
@@ -57,7 +99,8 @@ public:
 	ze_result_t zesRun(zes_device_handle_t device);
 	bool isBDF(const char *bdf);
 	std::string getMeiDevicePath() { return deviceProperties.meiDevicePath; }
-	std::string getFWStatus() { return deviceProperties.fwStatus; }
+	std::string getFWStatus();
+	std::optional<std::string> getGfxFwVersion();
 	void getBDF(bdfID &bdf) const
 	{
 		bdf.domain = this->domain;

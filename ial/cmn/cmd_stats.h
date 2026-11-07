@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <cstdint>
 #include <limits>
 #include <functional>
@@ -23,6 +24,7 @@
 #include <iomanip>
 #include <nlohmann/json.hpp>
 #include <ze_api.h>
+#include "proc_fdinfo.h"
 
 enum statsCmdType
 {
@@ -157,6 +159,13 @@ struct FabricPortSample
 	bool hasThroughput = false;
 };
 
+struct ProcessUtilEntry
+{
+	uint32_t pid = 0;
+	std::string name;
+	ProcUtil util;
+};
+
 struct DeviceMetrics
 {
 	uint32_t deviceIndex = 0;
@@ -241,6 +250,8 @@ struct DeviceMetrics
 	std::vector<std::string> mediaEmEngineDetails;
 
 	bool hasFabricData = false;
+
+	std::vector<ProcessUtilEntry> processUtils;
 };
 
 /**
@@ -263,6 +274,7 @@ private:
 	static void addEngineInstanceRows(TableBuilder &table, const nlohmann::ordered_json &deviceJson,
 									  const std::string &label, const std::vector<std::string> &path);
 	static void addRasCounterRows(TableBuilder &table, const nlohmann::ordered_json &deviceJson);
+	static void addProcessUtilRows(TableBuilder &table, const nlohmann::ordered_json &deviceJson);
 };
 
 class OfflinePagesTextPrinter : public Printer
@@ -293,6 +305,17 @@ struct OfflinePagesOutcome
 	std::string summaryMessage;
 };
 
+/// fdinfo engine keys ("ccs", "vcs", ...). Transparent comparator so a std::string_view key
+/// can be looked up without building a std::string.
+using FdinfoEngineKeys = std::set<std::string, std::less<>>;
+
+/// One fdinfo sampling window, as cmdStats::collectProcessUtils() closes it.
+struct FdinfoUtilWindow
+{
+	fdinfo::PidUtilMap utilMap;	 ///< Per-process engine utilisation, the caller's own PID excluded.
+	FdinfoEngineKeys measurable; ///< Engine classes fdinfo reported for the device, busy or not.
+};
+
 class cmdStats : public cmds
 {
 
@@ -308,6 +331,17 @@ public:
 	// without a GPU: pageOffline is not virtual, so the HAL cannot be substituted.
 	static void annotateOfflinePagesFailure(ze_result_t result, nlohmann::ordered_json &deviceJson);
 	static OfflinePagesOutcome summarizeOfflinePages(const std::vector<ze_result_t> &deviceResults);
+
+	// Pure fdinfo fallback helpers for the process/engine-utilization path. Public so they
+	// can be unit tested directly, without a device or Level Zero handle.
+	static void deriveEngineTrackersFromFdinfo(const fdinfo::PidUtilMap &utilMap, const FdinfoEngineKeys &measurable,
+											   std::vector<EngineInstanceTracker> &trackers,
+											   std::string_view engineKey);
+	static void applyFdinfoUtilFallback(const fdinfo::PidUtilMap &utilMap, const FdinfoEngineKeys &measurable,
+										DeviceMetrics &metrics);
+	static std::vector<ProcessUtilEntry> buildProcessUtilEntries(const fdinfo::PidUtilMap &utilMap,
+																 const std::vector<zes_process_state_t> &processList,
+																 uint32_t selfPid);
 
 private:
 	static ze_result_t runListOfflinePages(std::vector<devInfo> &deviceList, Printer *printer, bool jsonMode);
@@ -359,6 +393,8 @@ private:
 										  DeviceMetrics &metrics, nlohmann::ordered_json &deviceJson, bool collectRas,
 										  bool collectEuMetrics);
 	static ze_result_t listOfflinePages(devInfo *device, nlohmann::ordered_json &deviceJson);
+	static FdinfoUtilWindow collectProcessUtils(devInfo *device, const std::vector<fdinfo::ProcessSnapshot> &fdBefore,
+												DeviceMetrics &metrics);
 };
 
 using statsSubCmdFunc = ze_result_t (cmdStats::*)(devInfo *d);

@@ -2,8 +2,9 @@
  * Copyright (C) 2026 Intel Corporation
  * SPDX-License-Identifier: MIT
  *
- * Unit tests for getPciSubsystemDeviceId(). Each test builds a fake sysfs PCI
- * device tree under a scratch directory, so no GPU is required.
+ * Unit tests for getPciSubsystemDeviceId(), isIntelGpu(), isRootComplexIntegrated(),
+ * resetPciFunction() and getPciClassCode(). Each test builds a fake sysfs PCI device tree under a scratch directory, so
+ * no GPU is required.
  */
 
 // Empty in clang-tidy passes run without -Dwith_tests, where doctest is not on the include path.
@@ -14,11 +15,14 @@
 
 #include "pci_sysfs.h"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <span>
 #include <string>
 #include <system_error>
+#include <vector>
 #include <unistd.h>
 
 namespace fs = std::filesystem;
@@ -68,8 +72,32 @@ public:
 	 */
 	void setSubsystemDevice(const std::string &dir, const std::string &contents) const
 	{
+		setAttribute(dir, "subsystem_device", contents);
+	}
+
+	/**
+	 * @brief Writes <root>/<dir>/<name>
+	 *
+	 * @param [in] dir      Device directory name, normally a BDF
+	 * @param [in] name     Attribute name, e.g. "vendor"
+	 * @param [in] contents Attribute contents, trailing newline included as sysfs writes it
+	 */
+	void setAttribute(const std::string &dir, const std::string &name, const std::string &contents) const
+	{
 		fs::create_directories(root / dir);
-		std::ofstream(root / dir / "subsystem_device") << contents;
+		std::ofstream(root / dir / name) << contents;
+	}
+
+	/**
+	 * @brief Writes <root>/<dir>/class the way the kernel exposes it
+	 *
+	 * @param [in] dir      Device directory name, normally a BDF
+	 * @param [in] contents Attribute contents, trailing newline included as sysfs writes it
+	 */
+	void setClass(const std::string &dir, const std::string &contents) const
+	{
+		fs::create_directories(root / dir);
+		std::ofstream(root / dir / "class") << contents;
 	}
 };
 
@@ -119,6 +147,367 @@ TEST_CASE("getPciSubsystemDeviceId: a malformed BDF cannot reach files outside i
 		CAPTURE(bdf);
 		CHECK_FALSE(getPciSubsystemDeviceId(bdf, sysfs.root).has_value());
 	}
+}
+
+namespace {
+
+// The CRI card, the Arrow Lake NPU beside it, and their modalias, as on a CRI host.
+constexpr const char *CRI_MODALIAS = "pci:v00008086d0000674Csv00008086sd00001000bc12sc00i00";
+constexpr const char *NPU_BDF = "0000:00:0b.0";
+constexpr const char *NPU_MODALIAS = "pci:v00008086d0000AD1Dsv00008086sd00007270bc12sc00i00";
+
+/// A modules.alias with the CRI card claimed by xe and the NPU by intel_vpu, as depmod writes it.
+[[nodiscard]] fs::path writeModulesAlias(const FakePciDevices &sysfs)
+{
+	const fs::path aliases = sysfs.root / "modules.alias";
+	std::ofstream(aliases) << "# Aliases extracted from modules themselves.\n"
+						   << "alias pci:v00008086d0000AD1Dsv*sd*bc*sc*i* intel_vpu\n"
+						   << "alias pci:v00008086d0000674Csv*sd*bc*sc*i* xe\n"
+						   << "alias pci:v00008086d00007D67sv*sd*bc03sc*i* i915\n";
+	return aliases;
+}
+
+/// An Intel device of PCI @p classCode, bound to @p driver unless it is empty.
+void addIntelDevice(const FakePciDevices &sysfs, const std::string &bdf, const std::string &classCode,
+					const std::string &modalias, const std::string &driver)
+{
+	sysfs.setAttribute(bdf, "vendor", "0x8086\n");
+	sysfs.setAttribute(bdf, "class", classCode + "\n");
+	sysfs.setAttribute(bdf, "modalias", modalias + "\n");
+	if (!driver.empty()) {
+		fs::create_directories(sysfs.root / "drivers" / driver);
+		fs::create_directory_symlink(fs::path{"../drivers"} / driver, sysfs.root / bdf / "driver");
+	}
+}
+
+} // namespace
+
+TEST_CASE("isIntelGpu: a display-class Intel device is a GPU")
+{
+	const FakePciDevices sysfs("gpu");
+	const fs::path aliases = writeModulesAlias(sysfs);
+	sysfs.setAttribute(BDF, "vendor", "0x8086\n");
+	sysfs.setAttribute(BDF, "class", "0x030000\n");
+	CHECK(isIntelGpu(BDF, sysfs.root, aliases));
+	sysfs.setAttribute(BDF, "class", "0x038000\n"); // display controller, "other" subclass
+	CHECK(isIntelGpu(BDF, sysfs.root, aliases));
+}
+
+TEST_CASE("isIntelGpu: a processing accelerator is a GPU when xe or i915 is bound to it or claims it")
+{
+	const FakePciDevices sysfs("accelerator");
+	const fs::path aliases = writeModulesAlias(sysfs);
+
+	SUBCASE("bound to xe")
+	{
+		addIntelDevice(sysfs, BDF, "0x120000", CRI_MODALIAS, "xe");
+		CHECK(isIntelGpu(BDF, sysfs.root, aliases));
+	}
+	SUBCASE("no driver bound, claimed by xe in modules.alias")
+	{
+		addIntelDevice(sysfs, BDF, "0x120000", CRI_MODALIAS, "");
+		CHECK(isIntelGpu(BDF, sysfs.root, aliases));
+	}
+	SUBCASE("no driver bound and no modules.alias to match")
+	{
+		addIntelDevice(sysfs, BDF, "0x120000", CRI_MODALIAS, "");
+		CHECK_FALSE(isIntelGpu(BDF, sysfs.root, sysfs.root / "no-such-modules.alias"));
+	}
+}
+
+TEST_CASE("isIntelGpu: the NPU shares the accelerator class but is not a GPU")
+{
+	const FakePciDevices sysfs("npu");
+	const fs::path aliases = writeModulesAlias(sysfs);
+	addIntelDevice(sysfs, NPU_BDF, "0x120000", NPU_MODALIAS, "intel_vpu");
+	CHECK_FALSE(isIntelGpu(NPU_BDF, sysfs.root, aliases));
+
+	const FakePciDevices unbound("npu-unbound");
+	addIntelDevice(unbound, NPU_BDF, "0x120000", NPU_MODALIAS, "");
+	CHECK_FALSE(isIntelGpu(NPU_BDF, unbound.root, writeModulesAlias(unbound)));
+}
+
+TEST_CASE("isIntelGpu: another vendor, another class, or missing attributes")
+{
+	const FakePciDevices sysfs("notgpu");
+	const fs::path aliases = writeModulesAlias(sysfs);
+	CHECK_FALSE(isIntelGpu(BDF, sysfs.root, aliases));
+	sysfs.setAttribute(BDF, "vendor", "0x8086\n");
+	CHECK_FALSE(isIntelGpu(BDF, sysfs.root, aliases)); // no class, no modalias
+	sysfs.setAttribute(BDF, "class", "0x020000\n");	   // network controller
+	CHECK_FALSE(isIntelGpu(BDF, sysfs.root, aliases));
+	// Another vendor's device is never an Intel GPU, whatever its class or alias.
+	sysfs.setAttribute(BDF, "vendor", "0x10de\n");
+	sysfs.setAttribute(BDF, "class", "0x030000\n");
+	sysfs.setAttribute(BDF, "modalias", std::string{CRI_MODALIAS} + "\n");
+	CHECK_FALSE(isIntelGpu(BDF, sysfs.root, aliases));
+	CHECK_FALSE(isIntelGpu("../" + std::string{BDF}, sysfs.root, aliases));
+}
+
+namespace {
+
+constexpr std::uint8_t PCIE_ENDPOINT = 0x0;
+constexpr std::uint8_t PCIE_RC_INTEGRATED_ENDPOINT = 0x9;
+
+/// A 256-byte config space whose capability list is a PM capability followed by a PCIe one of @p type.
+[[nodiscard]] std::vector<std::uint8_t> configWithPcieType(std::uint8_t type)
+{
+	std::vector<std::uint8_t> config(256);
+	config[0x06] = 0x10; // status: capability list present
+	config[0x34] = 0x40; // capability pointer
+	config[0x40] = 0x01; // PM capability ...
+	config[0x41] = 0x70; // ... next at 0x70
+	config[0x70] = 0x10; // PCI Express capability, last in the list
+	config[0x72] = static_cast<std::uint8_t>(type << 4);
+	return config;
+}
+
+/// Lays out <root>/devices/<parents...>/<bdf> with <root>/bus/<bdf> linking to it, as sysfs does.
+void addDevice(const FakePciDevices &sysfs, const std::string &parents, const std::string &bdf,
+			   const std::vector<std::uint8_t> &config)
+{
+	const fs::path real = sysfs.root / "devices" / parents / bdf;
+	fs::create_directories(real);
+	fs::create_directories(sysfs.root / "bus");
+	fs::create_directory_symlink(fs::relative(real, sysfs.root / "bus"), sysfs.root / "bus" / bdf);
+	std::ofstream(real / "config", std::ios::binary)
+		.write(reinterpret_cast<const char *>(config.data()), static_cast<std::streamsize>(config.size()));
+}
+
+} // namespace
+
+TEST_CASE("pcieDeviceType: reads the Device/Port Type from the PCI Express capability")
+{
+	CHECK(pcieDeviceType(configWithPcieType(PCIE_RC_INTEGRATED_ENDPOINT)) == PCIE_RC_INTEGRATED_ENDPOINT);
+	CHECK(pcieDeviceType(configWithPcieType(PCIE_ENDPOINT)) == PCIE_ENDPOINT);
+}
+
+TEST_CASE("pcieDeviceType: nullopt when the capability cannot be found")
+{
+	auto config = configWithPcieType(PCIE_ENDPOINT);
+	// What an unprivileged reader gets: the first 64 bytes only.
+	CHECK_FALSE(pcieDeviceType(std::span{config}.first(64)).has_value());
+	CHECK_FALSE(pcieDeviceType({}).has_value());
+
+	auto noList = config;
+	noList[0x06] = 0;
+	CHECK_FALSE(pcieDeviceType(noList).has_value());
+
+	auto looping = config;
+	looping[0x41] = 0x40; // PM capability points at itself, PCIe never reached
+	CHECK_FALSE(pcieDeviceType(looping).has_value());
+}
+
+TEST_CASE("isRootComplexIntegrated: the PCIe device type decides, wherever the device sits")
+{
+	const FakePciDevices sysfs("pcietype");
+	addDevice(sysfs, "pci0000:00", "0000:00:02.0", configWithPcieType(PCIE_RC_INTEGRATED_ENDPOINT));
+	// A discrete GPU a VM places directly on its root bus is still an endpoint.
+	addDevice(sysfs, "pci0000:00", "0000:00:05.0", configWithPcieType(PCIE_ENDPOINT));
+	addDevice(sysfs, "pci0000:00/0000:00:01.0", "0000:03:00.0", configWithPcieType(PCIE_ENDPOINT));
+	const fs::path bus = sysfs.root / "bus";
+
+	CHECK(isRootComplexIntegrated("0000:00:02.0", bus));
+	CHECK_FALSE(isRootComplexIntegrated("0000:00:05.0", bus));
+	CHECK_FALSE(isRootComplexIntegrated("0000:03:00.0", bus));
+}
+
+TEST_CASE("isRootComplexIntegrated: without config space access, topology decides")
+{
+	const FakePciDevices sysfs("topology");
+	const std::vector<std::uint8_t> unprivileged = [] {
+		auto config = configWithPcieType(PCIE_ENDPOINT);
+		config.resize(64);
+		return config;
+	}();
+	addDevice(sysfs, "pci0000:00", "0000:00:02.0", unprivileged);
+	addDevice(sysfs, "pci0000:00/0000:00:01.0", "0000:03:00.0", unprivileged);
+	const fs::path bus = sysfs.root / "bus";
+
+	CHECK(isRootComplexIntegrated("0000:00:02.0", bus));
+	CHECK_FALSE(isRootComplexIntegrated("0000:03:00.0", bus));
+	CHECK_FALSE(isRootComplexIntegrated("0000:04:00.0", bus)); // not on the bus
+	CHECK_FALSE(isRootComplexIntegrated("../0000:00:02.0", bus));
+}
+
+namespace {
+
+/// The first line of @p path, or "" when it cannot be read.
+[[nodiscard]] std::string firstLine(const fs::path &path)
+{
+	std::string line;
+	std::getline(std::ifstream(path), line);
+	return line;
+}
+
+} // namespace
+
+TEST_CASE("resetPciFunction: unbinds the driver, resets the function, binds the driver again")
+{
+	const FakePciDevices sysfs("reset");
+	const fs::path device = sysfs.root / "devices" / BDF;
+	const fs::path driver = sysfs.root / "drivers" / "xe";
+	fs::create_directories(device);
+	fs::create_directories(driver);
+	for (const char *attribute : {"unbind", "bind"}) {
+		std::ofstream(driver / attribute) << "";
+	}
+	std::ofstream(device / "reset") << "";
+	fs::create_directory_symlink("../../drivers/xe", device / "driver");
+
+	CHECK_FALSE(resetPciFunction(BDF, sysfs.root));
+	CHECK(firstLine(driver / "unbind") == BDF);
+	CHECK(firstLine(device / "reset") == "1");
+	CHECK(firstLine(driver / "bind") == BDF);
+}
+
+TEST_CASE("resetPciFunction: a device without a driver is only reset")
+{
+	const FakePciDevices sysfs("unbound");
+	const fs::path device = sysfs.root / "devices" / BDF;
+	fs::create_directories(device);
+	std::ofstream(device / "reset") << "";
+	CHECK_FALSE(resetPciFunction(BDF, sysfs.root));
+	CHECK(firstLine(device / "reset") == "1");
+}
+
+TEST_CASE("resetPciFunction: a failed unbind leaves the device untouched")
+{
+	const FakePciDevices sysfs("unbindfail");
+	const fs::path device = sysfs.root / "devices" / BDF;
+	fs::create_directories(device);
+	fs::create_directories(sysfs.root / "drivers" / "xe"); // no unbind attribute to write
+	std::ofstream(device / "reset") << "";
+	fs::create_directory_symlink("../../drivers/xe", device / "driver");
+	CHECK(resetPciFunction(BDF, sysfs.root) == std::errc::no_such_file_or_directory);
+	CHECK(firstLine(device / "reset").empty());
+}
+
+TEST_CASE("resetPciFunction: not supported without a reset attribute, invalid for a malformed BDF")
+{
+	const FakePciDevices sysfs("noreset");
+	fs::create_directories(sysfs.root / "devices" / BDF);
+	CHECK(resetPciFunction(BDF, sysfs.root) == std::errc::not_supported);
+	for (const char *bdf : {"", "..", "03:00.0", "0000:03:00.0/.."}) {
+		CAPTURE(bdf);
+		CHECK(resetPciFunction(bdf, sysfs.root) == std::errc::invalid_argument);
+	}
+}
+
+TEST_CASE("getPciClassCode: splits the class the kernel prints into its three bytes")
+{
+	const FakePciDevices devices("class_ok");
+	devices.setClass(BDF, "0x120000\n");
+	CHECK(getPciClassCode(BDF, devices.root) == PciClassCode{.baseClass = 0x12, .subClass = 0x00, .progIf = 0x00});
+	devices.setClass(BDF, "0x038001\n");
+	CHECK(getPciClassCode(BDF, devices.root) == PciClassCode{.baseClass = 0x03, .subClass = 0x80, .progIf = 0x01});
+}
+
+TEST_CASE("getPciClassCode: nullopt when the attribute is missing or malformed, or the BDF is")
+{
+	const FakePciDevices devices("class_bad");
+	CHECK_FALSE(getPciClassCode(BDF, devices.root).has_value());
+	for (const char *contents : {"030000\n", "0x0300\n", "0x03000000\n", "0xgg0000\n", "\n"}) {
+		devices.setClass(BDF, contents);
+		CHECK_MESSAGE(!getPciClassCode(BDF, devices.root).has_value(), contents);
+	}
+	devices.setClass(BDF, "0x030000\n");
+	CHECK_FALSE(getPciClassCode("../" + std::string{BDF}, devices.root).has_value());
+}
+
+TEST_CASE("parsePciClassCode: six hex digits, base class first")
+{
+	CHECK(parsePciClassCode("030000") == PciClassCode{.baseClass = 0x03, .subClass = 0x00, .progIf = 0x00});
+	CHECK(parsePciClassCode("FFFFFF") == PciClassCode{.baseClass = 0xFF, .subClass = 0xFF, .progIf = 0xFF});
+	CHECK_FALSE(parsePciClassCode("0300").has_value());
+	CHECK_FALSE(parsePciClassCode("03000z").has_value());
+	CHECK_FALSE(parsePciClassCode("").has_value());
+}
+
+namespace {
+
+/**
+ * @brief Lays out the B580-like path pci0000:00/00:01.0 (root port)/01:00.0/02:01.0/<BDF> under
+ *        <root>/devices, with <root>/bus/<function> links to each function as the kernel does
+ *
+ * @param [in] sysfs The scratch tree.
+ * @return The bus directory to pass as pciDevRoot.
+ */
+fs::path layOutPath(const FakePciDevices &sysfs)
+{
+	const auto rootPort = sysfs.root / "devices" / "pci0000:00" / "0000:00:01.0";
+	const auto device = rootPort / "0000:01:00.0" / "0000:02:01.0" / BDF;
+	fs::create_directories(device);
+	fs::create_directories(sysfs.root / "bus");
+	for (auto dir = device; dir != rootPort.parent_path(); dir = dir.parent_path()) {
+		fs::create_directory_symlink(dir, sysfs.root / "bus" / dir.filename());
+	}
+	std::ofstream(rootPort / "max_link_speed") << "32.0 GT/s PCIe\n";
+	std::ofstream(rootPort / "max_link_width") << "16\n";
+	std::ofstream(rootPort / "0000:01:00.0" / "max_link_speed") << "16.0 GT/s PCIe\n";
+	return sysfs.root / "bus";
+}
+
+} // namespace
+
+TEST_CASE("getRootPortMaxLink: reads the root port above any switch, as a generation")
+{
+	const FakePciDevices sysfs("root_port");
+	const auto bus = layOutPath(sysfs);
+	const auto link = getRootPortMaxLink(BDF, bus);
+	CHECK(link.generation == 5);
+	CHECK(link.width == 16);
+	// The root port itself has none above it.
+	const auto own = getRootPortMaxLink("0000:00:01.0", bus);
+	CHECK_FALSE(own.generation.has_value());
+	CHECK_FALSE(getRootPortMaxLink("../x", bus).generation.has_value());
+}
+
+TEST_CASE("getPcieAerCounts: reads totals and the replay counters, nullopt without AER")
+{
+	const FakePciDevices sysfs("aer");
+	const auto bus = layOutPath(sysfs);
+	CHECK_FALSE(getPcieAerCounts(BDF, bus).has_value());
+	const auto dir = bus / BDF;
+	std::ofstream(dir / "aer_dev_correctable")
+		<< "RxErr 0\nBadTLP 1\nBadDLLP 2\nRollover 3\nTimeout 4\nNonFatalErr 0\nTOTAL_ERR_COR 10\n";
+	std::ofstream(dir / "aer_dev_nonfatal") << "Undefined 0\nDLP 0\nTOTAL_ERR_NONFATAL 5\n";
+	std::ofstream(dir / "aer_dev_fatal") << "Undefined 0\nTOTAL_ERR_FATAL 0\n";
+	const auto counts = getPcieAerCounts(BDF, bus);
+	REQUIRE(counts.has_value());
+	CHECK(counts->correctable == 10);
+	CHECK(counts->nonFatal == 5);
+	CHECK(counts->fatal == 0);
+	CHECK(counts->replayRollover == 3);
+	CHECK(counts->replayTimeout == 4);
+}
+
+TEST_CASE("getPcieAtomicOps: decodes Device Capabilities 2 and Control 2, nullopt on a short read")
+{
+	const FakePciDevices sysfs("atomic");
+	const auto bus = layOutPath(sysfs);
+	std::array<unsigned char, 256> config{};
+	config[0x06] = 0x10; // capabilities list present
+	config[0x34] = 0x40; // first capability
+	config[0x40] = 0x01; // power management, next at 0x50
+	config[0x41] = 0x50;
+	config[0x50] = 0x10;			// PCI Express
+	config[0x50 + 0x24 + 0] = 0x80; // DevCap2 bit 7: 32-bit completer
+	config[0x50 + 0x24 + 1] = 0x01; // DevCap2 bit 8: 64-bit completer
+	config[0x50 + 0x28 + 0] = 0x40; // DevCtl2 bit 6: requester enable
+	std::ofstream(bus / BDF / "config", std::ios::binary)
+		.write(reinterpret_cast<const char *>(config.data()), config.size()); // NOLINT: byte buffer
+	const auto ops = getPcieAtomicOps(BDF, bus);
+	REQUIRE(ops.has_value());
+	CHECK(ops->completer32);
+	CHECK(ops->completer64);
+	CHECK_FALSE(ops->completer128Cas);
+	CHECK(ops->requesterEnabled);
+
+	// What an unprivileged read returns: only the first 64 bytes.
+	std::ofstream(bus / BDF / "config", std::ios::binary | std::ios::trunc)
+		.write(reinterpret_cast<const char *>(config.data()), 64); // NOLINT: byte buffer
+	CHECK_FALSE(getPcieAtomicOps(BDF, bus).has_value());
 }
 
 #endif // __has_include(<doctest/doctest.h>)

@@ -9,6 +9,8 @@ import (
 	"context"
 	"maps"
 	"slices"
+	"strconv"
+	"strings"
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
@@ -42,13 +44,21 @@ type ruleProcessor struct {
 	*HealthRule
 	logger      *zap.SugaredLogger
 	parentAttrs map[string]pcommon.Map
+	// Attributes to copy from the source data points to the status metric
+	copyAttrKeys []string
 }
 
 func newRuleProcessor(logger *zap.SugaredLogger, rule *HealthRule) *ruleProcessor {
+	copyAttrKeys := rule.CopyAttributes
+	if rule.Aggregate != nil {
+		// Copy also the attributes identifying the aggregation group.
+		copyAttrKeys = slices.Compact(slices.Sorted(slices.Values(slices.Concat(rule.CopyAttributes, rule.Aggregate.GroupBy, []string{rule.ParentRefAttribute}))))
+	}
 	return &ruleProcessor{
-		HealthRule:  rule,
-		logger:      logger,
-		parentAttrs: make(map[string]pcommon.Map),
+		HealthRule:   rule,
+		logger:       logger,
+		parentAttrs:  make(map[string]pcommon.Map),
+		copyAttrKeys: copyAttrKeys,
 	}
 }
 
@@ -131,7 +141,43 @@ func (p *ruleProcessor) updateMetrics(sm pmetric.ScopeMetrics) {
 		return
 	}
 
-	// Iterate over source metric data points and evaluate each against the state rules
+	dps := p.filterDataPoints(sourceDps)
+	if p.Aggregate != nil {
+		dps = p.aggregate(dps)
+	}
+
+	for _, dp := range dps {
+		sourceAttrs := dp.attrs
+
+		// Evaluate state rules to determine states and their values
+		states := p.evaluateStates(dp.value, p.parentID(sourceAttrs))
+
+		// Create health status metric
+		statusAttrs := pcommon.NewMap()
+		// Copy relevant attributes (semconv) from the source metric
+		for _, attrKey := range p.copyAttrKeys {
+			if attrVal, ok := sourceAttrs.Get(attrKey); ok {
+				attrVal.CopyTo(statusAttrs.PutEmpty(attrKey))
+			}
+		}
+		for key, val := range p.AddAttributes {
+			statusAttrs.PutStr(key, val)
+		}
+
+		p.createHealthMetric(statusDps, statusAttrs, states, dp.timestamp)
+	}
+}
+
+// numberDataPoint is a helper wrapper for processing number data points.
+type numberDataPoint struct {
+	attrs     pcommon.Map
+	value     float64
+	timestamp pcommon.Timestamp
+}
+
+// filterDataPoints returns the source data points that pass the filters.
+func (p *ruleProcessor) filterDataPoints(sourceDps pmetric.NumberDataPointSlice) []numberDataPoint {
+	dps := make([]numberDataPoint, 0, sourceDps.Len())
 	for _, dp := range sourceDps.All() {
 		sourceAttrs := dp.Attributes()
 
@@ -141,10 +187,8 @@ func (p *ruleProcessor) updateMetrics(sm pmetric.ScopeMetrics) {
 		}
 
 		// Apply parent filters
-		parentID := ""
 		if p.ParentRefAttribute != "" {
-			parentIDVal, _ := sourceAttrs.Get(p.ParentRefAttribute)
-			parentID = parentIDVal.Str()
+			parentID := p.parentID(sourceAttrs)
 			if parentID == "" {
 				p.logger.Debugw("empty or missing parent ref attribute (parent_ref_attribute)", "metric", p.SourceMetric, "ParentRefAttribute", p.ParentRefAttribute, "attributes", sourceAttrs.AsRaw())
 			}
@@ -169,24 +213,65 @@ func (p *ruleProcessor) updateMetrics(sm pmetric.ScopeMetrics) {
 			p.logger.Errorw("unsupported data point value type", "metric", p.SourceMetric, "valueType", t, "attributes", sourceAttrs.AsRaw())
 			continue
 		}
+		dps = append(dps, numberDataPoint{attrs: sourceAttrs, value: value, timestamp: dp.Timestamp()})
+	}
+	return dps
+}
 
-		// Evaluate state rules to determine states and their values
-		states := p.evaluateStates(value, parentID)
+// aggregate combines data points with identical parent and Aggregate.GroupBy
+// attribute values into one new data point (per group).
+func (p *ruleProcessor) aggregate(dps []numberDataPoint) []numberDataPoint {
+	groups := make([]numberDataPoint, 0, len(dps))
+	index := make(map[string]int)
+	for _, dp := range dps {
+		key := p.groupKey(dp.attrs)
+		i, exists := index[key]
+		if !exists {
+			g := numberDataPoint{attrs: pcommon.NewMap(), value: dp.value, timestamp: dp.timestamp}
+			for _, attrKey := range p.copyAttrKeys {
+				if attrVal, ok := dp.attrs.Get(attrKey); ok {
+					attrVal.CopyTo(g.attrs.PutEmpty(attrKey))
+				}
+			}
+			index[key] = len(groups)
+			groups = append(groups, g)
+			continue
+		}
 
-		// Create health status metric
-		statusAttrs := pcommon.NewMap()
-		// Copy relevant attributes (semconv) from the source metric
+		g := &groups[i]
+		g.value = p.Aggregate.apply(g.value, dp.value)
+		g.timestamp = max(g.timestamp, dp.timestamp)
 		for _, attrKey := range p.CopyAttributes {
-			if attrVal, ok := sourceAttrs.Get(attrKey); ok {
-				statusAttrs.PutStr(attrKey, attrVal.Str())
+			gVal, gOk := g.attrs.Get(attrKey)
+			val, ok := dp.attrs.Get(attrKey)
+			if gOk != ok || (ok && !gVal.Equal(val)) {
+				p.logger.Debugw("copy attribute differs within aggregation group", "metric", p.SourceMetric, "attribute", attrKey, "attributes", dp.attrs.AsRaw())
+				g.attrs.PutStr(attrKey, "")
 			}
 		}
-		for key, val := range p.AddAttributes {
-			statusAttrs.PutStr(key, val)
-		}
-
-		p.createHealthMetric(statusDps, statusAttrs, states, dp.Timestamp())
 	}
+	return groups
+}
+
+// groupKey returns string composed of parent ID + group_by attribute values.
+func (p *ruleProcessor) groupKey(attrs pcommon.Map) string {
+	var b strings.Builder
+	b.WriteString(strconv.Quote(p.parentID(attrs)))
+	for _, attrKey := range p.Aggregate.GroupBy {
+		b.WriteByte(':')
+		if attrVal, ok := attrs.Get(attrKey); ok {
+			b.WriteString(strconv.Quote(attrVal.AsString()))
+		}
+	}
+	return b.String()
+}
+
+func (p *ruleProcessor) parentID(attrs pcommon.Map) string {
+	if p.ParentRefAttribute == "" {
+		return ""
+	}
+	parentIDVal, _ := attrs.Get(p.ParentRefAttribute)
+	return parentIDVal.Str()
 }
 
 func (p *ruleProcessor) evaluateStates(value float64, parentID string) map[string]uint64 {
@@ -208,9 +293,14 @@ func (p *ruleProcessor) evaluateStates(value float64, parentID string) map[strin
 		}
 
 		for _, cond := range rule.Conditions {
-			if cond.match(value, parentAttrs) {
-				activeState = rule.StateName
-				break // continue to next state rule
+			// Stop at first condition with parent filter match. Otherwise
+			// default condition with lower threshold than device specific
+			// threshold, would override device specific one.
+			if cond.matchParent(parentAttrs) {
+				if cond.matchValue(value) {
+					activeState = rule.StateName
+				}
+				break
 			}
 		}
 	}

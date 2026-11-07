@@ -34,6 +34,7 @@
 #include <variant>
 #include <utility>
 #include <vector>
+#include "utility/watchdog/watchdog.h"
 
 namespace {
 
@@ -115,31 +116,27 @@ filterArgvAndExtract(std::span<char *const> argv, std::string_view flagShort, st
  * @brief Map from legacy numeric metric ID to canonical registry field name.
  *
  * Preserved for backward compatibility so that @c "dump -m 0,1,2" continues to work.
- * Unsupported legacy IDs (21, 27, 28) are absent from the map and produce an error log
+ * Unsupported legacy IDs (12-16, 21, 27-30) are absent from the map and produce an error log
  * entry in translateMetricQuery().
  */
 const std::unordered_map<int, std::string_view> LEGACY_METRIC_NAMES = {
-	{0, "utilization.gpu"},					// GPU Utilization (%)
-	{1, "power.draw"},						// GPU Power (W)
-	{2, "clocks.current.graphics"},			// GPU Frequency (MHz)
-	{3, "temperature.gpu"},					// GPU Core Temperature (C)
-	{4, "temperature.memory"},				// GPU Memory Temperature (C)
-	{5, "utilization.memory"},				// GPU Memory Utilization (%)
-	{6, "memory.read.bandwidth"},			// GPU Memory Read (kB/s)
-	{7, "memory.write.bandwidth"},			// GPU Memory Write (kB/s)
-	{8, "energy.consumed"},					// GPU Energy Consumed (J)
-	{9, "eu.active"},						// EU Array Active (%)
-	{10, "eu.stall"},						// EU Array Stall (%)
-	{11, "eu.idle"},						// EU Array Idle (%)
-	{12, "ras.reset"},						// Reset Counter
-	{13, "ras.programming.errors"},			// Programming Errors
-	{14, "ras.driver.errors"},				// Driver Errors
-	{15, "ras.cache.errors.correctable"},	// Cache Errors Correctable
-	{16, "ras.cache.errors.uncorrectable"}, // Cache Errors Uncorrectable
-	{17, "memory.bandwidth.utilization"},	// Memory Bandwidth Utilization (%)
-	{18, "memory.used"},					// Memory Used (MiB)
-	{19, "pcie.rx.throughput.kbs"},			// PCIe Read (kB/s)
-	{20, "pcie.tx.throughput.kbs"},			// PCIe Write (kB/s)
+	{0, "utilization.gpu"},			// GPU Utilization (%)
+	{1, "power.draw"},				// GPU Power (W)
+	{2, "clocks.current.graphics"}, // GPU Frequency (MHz)
+	{3, "temperature.gpu"},			// GPU Core Temperature (C)
+	{4, "temperature.memory"},		// GPU Memory Temperature (C)
+	{5, "utilization.memory"},		// GPU Memory Utilization (%)
+	{6, "memory.read.bandwidth"},	// GPU Memory Read (kB/s)
+	{7, "memory.write.bandwidth"},	// GPU Memory Write (kB/s)
+	{8, "energy.consumed"},			// GPU Energy Consumed (J)
+	{9, "eu.active"},				// EU Array Active (%)
+	{10, "eu.stall"},				// EU Array Stall (%)
+	{11, "eu.idle"},				// EU Array Idle (%)
+	// 12-16: Reset Counter, Programming/Driver Errors, Cache Errors -- not supported until RAS reads are reliable
+	{17, "memory.bandwidth.utilization"}, // Memory Bandwidth Utilization (%)
+	{18, "memory.used"},				  // Memory Used (MiB)
+	{19, "pcie.rx.throughput.kbs"},		  // PCIe Read (kB/s)
+	{20, "pcie.tx.throughput.kbs"},		  // PCIe Write (kB/s)
 	// 21: Xe Link Throughput -- not supported
 	{22, "utilization.compute"}, // Compute Engine Utilization (%)
 	{23, "utilization.render"},	 // Render Engine Utilization (%)
@@ -148,17 +145,16 @@ const std::unordered_map<int, std::string_view> LEGACY_METRIC_NAMES = {
 	{26, "utilization.copy"},	 // Copy Engine Utilization (%)
 	// 27: Media Enhancement Engine -- not supported
 	// 28: 3D Engine Utilization -- not supported
-	{29, "ras.non_compute.errors.correctable"},	  // Memory Errors Correctable
-	{30, "ras.non_compute.errors.uncorrectable"}, // Memory Errors Uncorrectable
-	{31, "utilization.compute"},				  // Compute Engine Group Utilization (%)
-	{32, "utilization.render"},					  // Render Engine Group Utilization (%)
-	{33, "utilization.media"},					  // Media Engine Group Utilization (%)
-	{34, "utilization.copy"},					  // Copy Engine Group Utilization (%)
-	{35, "clocks.throttle.reason"},				  // Throttle Reason
-	{36, "clocks.current.media"},				  // Media Engine Frequency (MHz)
-	{37, "clocks.current.memory"},				  // Memory Engine Frequency (MHz)
-	{38, "clocks.current.memory.voltage"},		  // Memory Voltage (V)
-	{39, "temperature.composite"},				  // GPU Composite Temperature (C)
+	// 29-30: Memory Errors -- not supported until RAS reads are reliable
+	{31, "utilization.compute"},		   // Compute Engine Group Utilization (%)
+	{32, "utilization.render"},			   // Render Engine Group Utilization (%)
+	{33, "utilization.media"},			   // Media Engine Group Utilization (%)
+	{34, "utilization.copy"},			   // Copy Engine Group Utilization (%)
+	{35, "clocks.throttle.reason"},		   // Throttle Reason
+	{36, "clocks.current.media"},		   // Media Engine Frequency (MHz)
+	{37, "clocks.current.memory"},		   // Memory Engine Frequency (MHz)
+	{38, "clocks.current.memory.voltage"}, // Memory Voltage (V)
+	{39, "temperature.composite"},		   // GPU Composite Temperature (C)
 };
 
 /**
@@ -762,10 +758,12 @@ ze_result_t runQueryLoopMode(DumpOutput out, std::span<const metrics::QueryMetri
 	const metrics::MetricInput inputs = metrics::inputsOf(fields);
 
 	while (!quitToken.stop_requested()) {
-		std::this_thread::sleep_for(loopInterval);
+		xpum::watchdog::keepalive();
+		xpum::watchdog::sleepFor(loopInterval);
 
+		const fdinfo::DeviceSnapshots fdNow = metrics::captureFdinfo(inputs);
 		for (std::size_t i = 0; i < numDevices; ++i) {
-			caches[i] = metrics::populateMetricCacheContinuous(deviceList[i], caches[i], inputs);
+			caches[i] = metrics::populateMetricCacheContinuous(deviceList[i], caches[i], inputs, &fdNow);
 		}
 
 		metrics::runMetricsWithCaches(out, fields, std::span<devInfo>(deviceList),
@@ -849,12 +847,14 @@ ze_result_t runOutputLoop(DumpOutput out, std::span<const metrics::QueryMetric *
 	const metrics::MetricInput inputs = metrics::inputsOf(fields);
 
 	const auto firstSampleDeadline = startTime + timing.interval;
+	const fdinfo::DeviceSnapshots fdBefore = metrics::captureFdinfo(inputs);
 	for (std::size_t i = 0; i < numDevices; ++i) {
-		caches[i] = metrics::populateMetricCacheBegin(deviceList[i], inputs);
+		caches[i] = metrics::populateMetricCacheBegin(deviceList[i], inputs, &fdBefore);
 	}
-	std::this_thread::sleep_until(firstSampleDeadline);
+	xpum::watchdog::sleepUntil(firstSampleDeadline);
+	const fdinfo::DeviceSnapshots fdAfter = metrics::captureFdinfo(inputs);
 	for (std::size_t i = 0; i < numDevices; ++i) {
-		metrics::populateMetricCacheEnd(deviceList[i], caches[i]);
+		metrics::populateMetricCacheEnd(deviceList[i], caches[i], &fdAfter);
 	}
 
 	metrics::runMetricsWithCaches(out, std::span<const metrics::QueryMetric *>{fields}, std::span<devInfo>(deviceList),
@@ -864,14 +864,16 @@ ze_result_t runOutputLoop(DumpOutput out, std::span<const metrics::QueryMetric *
 	}
 
 	if (!quitToken.stop_requested() && iter != 0) {
-		std::this_thread::sleep_for(timing.interval);
+		xpum::watchdog::sleepFor(timing.interval);
 	}
 
 	while (!quitToken.stop_requested()) {
+		xpum::watchdog::keepalive();
 		const auto cycleStartTime = std::chrono::steady_clock::now();
 
+		const fdinfo::DeviceSnapshots fdNow = metrics::captureFdinfo(inputs);
 		for (std::size_t i = 0; i < numDevices; ++i) {
-			caches[i] = metrics::populateMetricCacheContinuous(deviceList[i], caches[i], inputs);
+			caches[i] = metrics::populateMetricCacheContinuous(deviceList[i], caches[i], inputs, &fdNow);
 		}
 		metrics::runMetricsWithCaches(out, std::span<const metrics::QueryMetric *>{fields},
 									  std::span<devInfo>(deviceList), std::span<const metrics::MetricCache>{caches});
@@ -880,7 +882,7 @@ ze_result_t runOutputLoop(DumpOutput out, std::span<const metrics::QueryMetric *
 			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - cycleStartTime);
 		const auto remainingSleep = timing.interval - collectionTimeMs;
 		if (remainingSleep.count() > 0) {
-			std::this_thread::sleep_for(remainingSleep);
+			xpum::watchdog::sleepFor(remainingSleep);
 		}
 
 		if (iter > 0 && --iter == 0) {
@@ -1079,12 +1081,15 @@ int cmdDump::runQuery(const std::string &metrics, const std::string &deviceSpec,
 	const metrics::MetricInput inputs = metrics::inputsOf(fields);
 	if (inputs != metrics::MetricInput::NONE) {
 		const auto sampleDeadline = std::chrono::steady_clock::now() + metrics::detail::SAMPLE_WINDOW;
+		// One fdinfo snapshot per time point serves every device: each reads every process's fds.
+		const fdinfo::DeviceSnapshots fdBefore = metrics::captureFdinfo(inputs);
 		for (std::size_t i = 0; i < numDevices; ++i) {
-			caches[i] = metrics::populateMetricCacheBegin(deviceList[i], inputs);
+			caches[i] = metrics::populateMetricCacheBegin(deviceList[i], inputs, &fdBefore);
 		}
-		std::this_thread::sleep_until(sampleDeadline);
+		xpum::watchdog::sleepUntil(sampleDeadline);
+		const fdinfo::DeviceSnapshots fdAfter = metrics::captureFdinfo(inputs);
 		for (std::size_t i = 0; i < numDevices; ++i) {
-			metrics::populateMetricCacheEnd(deviceList[i], caches[i]);
+			metrics::populateMetricCacheEnd(deviceList[i], caches[i], &fdAfter);
 		}
 	}
 	metrics::runMetricsWithCaches(out, std::span<const metrics::QueryMetric *>(fields), std::span<devInfo>(deviceList),

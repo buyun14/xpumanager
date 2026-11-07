@@ -449,16 +449,18 @@ func (z *Device) EnumOverclockDomains() ([]*Overclock, error) {
 func (z *Device) FabricPortGetMultiPortThroughput(ports []*FabricPort) ([]FabricPortThroughput, error) {
 	handles := wrappersToHandles[FabricPort](ports)
 	count := uint32(len(handles))
-	throughputs := make([]*FabricPortThroughput, count)
+	throughputs := make([]FabricPortThroughput, count)
+	// The underlying zesFabricPortGetMultiPortThroughput passes ptrs to the C
+	// code as pointer-to-pointer. Thus, all elements of the slice must be pinned.
+	ptrs := make([]*FabricPortThroughput, count)
+	var pinner runtime.Pinner
+	defer pinner.Unpin()
 	for i := range throughputs {
-		throughputs[i] = &FabricPortThroughput{}
+		pinner.Pin(&throughputs[i])
+		ptrs[i] = &throughputs[i]
 	}
-	ret := zesFabricPortGetMultiPortThroughput(z.handle, count, handles, throughputs)
-	retThroughput := make([]FabricPortThroughput, count)
-	for i, t := range throughputs {
-		retThroughput[i] = *t
-	}
-	return retThroughput, ret.ToError()
+	ret := zesFabricPortGetMultiPortThroughput(z.handle, count, handles, ptrs)
+	return throughputs, ret.ToError()
 }
 
 // GetDomainProperties wraps the zesOverclockGetDomainProperties function:
@@ -570,12 +572,10 @@ func (z *Diagnostics) GetTests() ([]DiagTest, error) {
 
 // RunTests wraps the zesDiagnosticsRunTests function:
 // https://oneapi-src.github.io/level-zero-spec/level-zero/latest/sysman/api/apis/diagnostics.html#zesdiagnosticsruntests
-func (z *Diagnostics) RunTests(startIdx, endIdx uint32) ([]DiagResult, error) {
-	count := endIdx - startIdx + 1
-	results := make([]DiagResult, count)
-	ret := zesDiagnosticsRunTests(z.handle, startIdx, endIdx, results)
-	return results, ret.ToError()
-
+func (z *Diagnostics) RunTests(startIdx, endIdx uint32) (DiagResult, error) {
+	var result DiagResult
+	ret := zesDiagnosticsRunTests(z.handle, startIdx, endIdx, &result)
+	return result, ret.ToError()
 }
 
 // EnumEngineGroups wraps the zesDeviceEnumEngineGroups function:

@@ -11,7 +11,11 @@
 #include "sysman.h"
 #include <loader/ze_loader.h>
 #include <os.h>
+#include <algorithm>
+#include <cctype>
 #include <charconv>
+#include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <ranges>
 #include <set>
@@ -19,6 +23,32 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <ze_api.h>
+#include "utility/compat/format.h"
+#include "utility/bdf/bdf.h"
+
+namespace {
+
+/// The PCI address spelled by a canonical BDF ("dddd:bb:dd.f").
+[[nodiscard]] std::optional<zes_pci_address_t> addressOf(std::string_view bdf)
+{
+	if (!isValidBdf(bdf)) {
+		return std::nullopt;
+	}
+	bool parsed = true;
+	const auto field = [bdf, &parsed](std::size_t pos, std::size_t len) {
+		uint32_t value = 0;
+		const char *last = bdf.data() + pos + len;
+		const auto [end, ec] = std::from_chars(bdf.data() + pos, last, value, 16);
+		parsed = parsed && ec == std::errc{} && end == last;
+		return value;
+	};
+	const zes_pci_address_t address{
+		.domain = field(0, 4), .bus = field(5, 2), .device = field(8, 2), .function = field(11, 1)};
+	return parsed ? std::optional{address} : std::nullopt;
+}
+
+} // namespace
 
 /**
  * @brief Sets the print/debug level for the driver and synchronizes across modules
@@ -166,6 +196,8 @@ ze_result_t driver::zesInitialize()
 ze_result_t driver::init(bool skipZeInit) // NOLINT(readability-function-cognitive-complexity)
 {
 	TRACING(); // NOLINT(misc-const-correctness)
+	// Every device's pci::init() looks its MEI node up; one listing serves them all.
+	const MeiDeviceListScope meiDevices;
 
 	// Keep EU metrics disabled for explicit user override or on affected kernels
 	// before Level Zero initialization.
@@ -549,26 +581,74 @@ ze_result_t driver::run()
 }
 
 /**
- * @brief Gets the versions of the Level Zero loader components.
+ * @brief Gets the Level Zero loader's own entry from its component list.
  *
- * This function retrieves and prints the versions of the Level Zero loader components.
+ * The loader registers itself before any layer, so its entry is always first. The
+ * layers that follow are not reported: they share the loader's version and carry
+ * nothing of diagnostic value. The full list is still fetched because the loader
+ * contract allows ZE_RESULT_ERROR_INVALID_SIZE for an undersized array.
+ *
+ * @retval LoaderComponent  The loader's name, library version and API level.
+ * @retval std::nullopt      The loader is not initialized, the query failed, or it
+ *                           reported no components. Never an error: this is
+ *                           diagnostic data, and a build that cannot describe its
+ *                           runtime must still describe itself.
  */
-void driver::getLoaderVersion(std::string *lzVersion)
+// A member rather than static on purpose: the loader only answers once zeInit has
+// run, and an initialized driver instance is what guarantees that.
+// NOLINTNEXTLINE(readability-convert-member-functions-to-static)
+std::optional<LoaderComponent> driver::getLoaderComponent()
 {
-	zel_component_version_t *versions;
-	size_t size = 0;
-	zelLoaderGetVersions(&size, nullptr);
-	DBG("zelLoaderGetVersions number of components found: {}\n", size);
-	versions = new zel_component_version_t[size];
-	zelLoaderGetVersions(&size, versions);
-
-	if (size > 0) {
-		*lzVersion = std::to_string(versions[0].component_lib_version.major) + ".";
-		*lzVersion += std::to_string(versions[0].component_lib_version.minor) + ".";
-		*lzVersion += std::to_string(versions[0].component_lib_version.patch);
+	size_t count = 0;
+	ze_result_t result = zelLoaderGetVersions(&count, nullptr);
+	if (result != ZE_RESULT_SUCCESS || count == 0) {
+		DBG("zelLoaderGetVersions count query returned 0x{:X} ({}), {} components\n", result,
+			l0_error_to_string(result), count);
+		return std::nullopt;
 	}
 
-	delete[] versions;
+	std::vector<zel_component_version_t> raw(count);
+	result = zelLoaderGetVersions(&count, raw.data());
+	if (result != ZE_RESULT_SUCCESS) {
+		DBG("zelLoaderGetVersions data query returned 0x{:X} ({})\n", result, l0_error_to_string(result));
+		return std::nullopt;
+	}
+	// The loader may report fewer components than the count query promised.
+	raw.resize(std::min(count, raw.size()));
+	if (raw.empty()) {
+		return std::nullopt;
+	}
+
+	const zel_component_version_t &v = raw.front();
+	// component_name is a fixed-size char array that the loader is not required to
+	// NUL-terminate when the name fills it exactly, so bound the search by its size.
+	const std::string_view name{v.component_name, sizeof(v.component_name)};
+	// The ZE_MAJOR_VERSION / ZE_MINOR_VERSION split, done on unsigned operands: both
+	// ze_api_version_t and the macros' own literals are signed.
+	constexpr uint32_t majorShift = 16U;
+	constexpr uint32_t minorMask = 0xFFFFU;
+	const auto spec = static_cast<uint32_t>(v.spec_version);
+	return LoaderComponent{
+		.name = std::string{name.substr(0, name.find('\0'))},
+		.version = xpum::compat::format("{}.{}.{}", v.component_lib_version.major, v.component_lib_version.minor,
+										v.component_lib_version.patch),
+		.specVersion = xpum::compat::format("{}.{}", spec >> majorShift, spec & minorMask),
+	};
+}
+
+/**
+ * @brief Gets the version of the Level Zero loader itself.
+ *
+ * @retval version       The loader library version, "major.minor.patch".
+ * @retval std::nullopt  The loader reported no components; see getLoaderComponent().
+ */
+std::optional<std::string> driver::getLoaderVersion()
+{
+	const auto loader = getLoaderComponent();
+	if (!loader.has_value()) {
+		return std::nullopt;
+	}
+	return loader->version;
 }
 
 /*
@@ -743,7 +823,7 @@ ze_result_t driver::findOneToken(std::string_view token, std::vector<devInfo> *d
 	// Empty token means "all devices" — caller passed nullptr or "".
 	if (token.empty()) {
 		uint32_t deviceIndex = 0;
-		for (devGroup &dg : std::span{devs, driverCount}) {
+		for (devGroup &dg : reportedGroups()) {
 			for (device &dev : dg.dev) {
 				DBG("No BDF provided, adding all devices.\n");
 				dev.addInfo(devList, deviceIndex++);
@@ -751,7 +831,7 @@ ze_result_t driver::findOneToken(std::string_view token, std::vector<devInfo> *d
 		}
 	} else {
 		uint32_t deviceIndex = 0;
-		for (devGroup &dg : std::span{devs, driverCount}) {
+		for (devGroup &dg : reportedGroups()) {
 			for (device &dev : dg.dev) {
 				if (dev.isBDF(bdfStr.c_str())) {
 					dev.addInfo(devList, deviceIndex);
@@ -827,8 +907,8 @@ void driver::findSurvDevice(const char *bdf, std::vector<devInfo> *survDevList)
 {
 	// Surv device indices continue sequentially after all normal devices
 	uint32_t deviceIndex = 0;
-	for (uint32_t i = 0; i < driverCount; i++) {
-		deviceIndex += devs[i].totalDevicesCount;
+	for (const devGroup &dg : reportedGroups()) {
+		deviceIndex += dg.totalDevicesCount;
 	}
 
 	const std::string_view bdfView{bdf ? bdf : ""};
@@ -849,4 +929,101 @@ void driver::findSurvDevice(const char *bdf, std::vector<devInfo> *survDevList)
 		}
 		deviceIndex++;
 	}
+}
+
+/**
+ * @brief findDevice() for recovery: a BDF that Level Zero does not report still resolves.
+ *
+ * When the driver found no usable GPU, or not the one named, an Intel GPU
+ * device at that BDF on the PCI bus resolves to a device that has no Level Zero
+ * handles (see device::pciOnlyInit()); PCI reset and cold reset work on it.
+ * Works whether or not init() succeeded, including when it failed partway. A
+ * device index still needs Level Zero, which is what numbers the devices; a
+ * PCI-only device is numbered after the reported and survivability devices.
+ *
+ * @param[in]  bdf      Comma-separated BDFs or device indices; empty means all reported devices.
+ * @param[out] devList  Receives the matching devices.
+ *
+ * @retval ZE_RESULT_SUCCESS                At least one token matched (or @p bdf is empty).
+ * @retval ZE_RESULT_ERROR_INVALID_ARGUMENT No token matched; each miss has been logged.
+ */
+ze_result_t driver::findDeviceForRecovery(const char *bdf, std::vector<devInfo> *devList)
+{
+	TRACING();
+	const std::string_view spec{bdf != nullptr ? bdf : ""};
+	if (spec.empty()) {
+		return findDevice(bdf, devList);
+	}
+
+	// Number PCI-only devices after the reported and survivability ones, so no two share an index.
+	uint32_t firstPciOnlyIndex = svZesDevs.survDevCount;
+	for (const devGroup &dg : reportedGroups()) {
+		firstPciOnlyIndex += static_cast<uint32_t>(dg.dev.size());
+	}
+
+	const auto sizeBefore = devList->size();
+	for (const auto part : spec | std::views::split(',')) {
+		std::string token{part.begin(), part.end()};
+		if (token.empty()) {
+			continue;
+		}
+		if (!isValidBdf(token)) {
+			if (findOneToken(token, devList) != ZE_RESULT_SUCCESS && !initialized) {
+				ERR("Without a working Level Zero driver, address the device by PCI BDF (e.g. 0000:03:00.0).\n");
+			}
+			continue;
+		}
+		std::ranges::transform(token, token.begin(),
+							   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+		bool reported = false;
+		uint32_t index = 0;
+		for (devGroup &dg : reportedGroups()) {
+			for (device &dev : dg.dev) {
+				if (!reported && dev.isBDF(token.c_str())) {
+					dev.addInfo(devList, index);
+					reported = true;
+				}
+				index++;
+			}
+		}
+		if (reported) {
+			continue;
+		}
+		if (device *dev = pciOnlyDevice(token)) {
+			const auto position =
+				std::ranges::find(pciOnlyDevs, dev, &std::unique_ptr<device>::get) - pciOnlyDevs.begin();
+			DBG("{} is not reported by Level Zero; using it through PCI alone.\n", token);
+			dev->addInfo(devList, firstPciOnlyIndex + static_cast<uint32_t>(position));
+			continue;
+		}
+		ERR("Device not found: '{}' is not an Intel GPU on the PCI bus.\n", token);
+	}
+	xpum::detail::deduplicateByIndex(*devList);
+	return devList->size() == sizeBefore ? ZE_RESULT_ERROR_INVALID_ARGUMENT : ZE_RESULT_SUCCESS;
+}
+
+/**
+ * @brief The device at @p bdf without Level Zero, created the first time it is asked for.
+ *
+ * @param[in] bdf  Canonical lower-case BDF.
+ *
+ * @retval device   An Intel GPU (see isIntelGpu()) sits at @p bdf.
+ * @retval nullptr  Nothing, or something else, sits there.
+ */
+device *driver::pciOnlyDevice(const std::string &bdf)
+{
+	TRACING();
+	for (const auto &dev : pciOnlyDevs) {
+		if (dev->isBDF(bdf.c_str())) {
+			return dev.get();
+		}
+	}
+	const auto address = addressOf(bdf);
+	if (!address || !isIntelGpu(bdf)) {
+		return nullptr;
+	}
+	auto &dev = pciOnlyDevs.emplace_back(std::make_unique<device>());
+	dev->pciOnlyInit(*address);
+	return dev.get();
 }

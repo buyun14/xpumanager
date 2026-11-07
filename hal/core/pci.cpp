@@ -7,6 +7,8 @@
 #include "pci.h"
 #include <assert.h>
 #include <gscupd.h>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -19,6 +21,71 @@
 #ifdef __GNUC__
 #pragma GCC diagnostic pop
 #endif
+
+namespace {
+
+// IGSC lists every MEI device of the system, about 300 ms with eight cards, and pci::init runs
+// once per device. While a MeiDeviceListScope lives, the lookups share one list.
+std::mutex meiListMutex;
+int meiListScopes = 0;
+std::optional<std::vector<pci_addr_mei_device>> sharedMeiList;
+
+[[nodiscard]] bool sameAddress(const zes_pci_address_t &a, const zes_pci_address_t &b)
+{
+	return a.domain == b.domain && a.bus == b.bus && a.device == b.device && a.function == b.function;
+}
+
+/**
+ * @brief Finds the MEI device of the GPU at @p address
+ *
+ * Lists the MEI devices through IGSC, or reuses the list taken earlier in the current
+ * MeiDeviceListScope.
+ *
+ * @param[in] address PCI address of the GPU
+ *
+ * @retval path    The MEI device path, e.g. /dev/mei0
+ * @retval nullopt No MEI device belongs to the GPU
+ */
+[[nodiscard]] std::optional<std::string> findMeiDevicePath(const zes_pci_address_t &address)
+{
+	const std::lock_guard lock{meiListMutex};
+	std::vector<pci_addr_mei_device> fresh;
+	if (meiListScopes == 0 || !sharedMeiList) {
+		fresh = gscupd{}.getPCIAddrAndMeiDevices();
+		if (meiListScopes > 0) {
+			sharedMeiList = std::move(fresh);
+		}
+	}
+	const auto &devices = meiListScopes > 0 ? *sharedMeiList : fresh;
+	for (const auto &dv : devices) {
+		if (sameAddress(dv.pciProps.address, address)) {
+			return dv.meiDevicePath;
+		}
+	}
+	return std::nullopt;
+}
+
+} // namespace
+
+/**
+ * @brief Starts sharing one list of the system's MEI devices among pci::init() calls.
+ */
+MeiDeviceListScope::MeiDeviceListScope()
+{
+	const std::lock_guard lock{meiListMutex};
+	++meiListScopes;
+}
+
+/**
+ * @brief Ends the sharing; once the last scope ends, the list is dropped.
+ */
+MeiDeviceListScope::~MeiDeviceListScope()
+{
+	const std::lock_guard lock{meiListMutex};
+	if (--meiListScopes == 0) {
+		sharedMeiList.reset();
+	}
+}
 
 /**
  * @brief Gets PCI properties for a device
@@ -359,42 +426,147 @@ devFuncType pci::getFuncType()
  */
 ze_result_t pci::init(zes_device_handle_t device)
 {
-	deviceProperties.meiDevicePath.clear();
-	deviceProperties.fwStatus = "unknown";
-
 	ze_result_t result;
 	result = getProperties(device, &deviceProperties.pciProps);
 	if (result != ZE_RESULT_SUCCESS) {
 		ERR("Failed to get PCI properties: 0x{:X} ({})\n", result, l0_error_to_string(result));
 		return result;
 	}
+	adoptAddress(deviceProperties.pciProps.address);
+	return result;
+}
 
-	domain = deviceProperties.pciProps.address.domain;
-	bus = deviceProperties.pciProps.address.bus;
-	dev = deviceProperties.pciProps.address.device;
-	func = deviceProperties.pciProps.address.function;
-	snprintf(bdfStr, sizeof(bdfStr), "%04x:%02x:%02x.%01x", deviceProperties.pciProps.address.domain,
-			 deviceProperties.pciProps.address.bus, deviceProperties.pciProps.address.device,
-			 deviceProperties.pciProps.address.function);
+/**
+ * @brief Initializes the PCI module from an address alone, for a device sysman does not report.
+ *
+ * Only the address, the BDF string and the MEI device path are known; every
+ * other PCI property stays zero.
+ *
+ * @param[in] address  PCI address of the device.
+ */
+void pci::initFromAddress(const zes_pci_address_t &address)
+{
+	TRACING();
+	deviceProperties.pciProps = {};
+	deviceProperties.pciProps.address = address;
+	adoptAddress(address);
+}
 
-	gscupd gsc;
-	std::vector<pci_addr_mei_device> devicesVec = gsc.getPCIAddrAndMeiDevices();
+/**
+ * @brief Records @p address and finds the device's MEI path among the GSC devices igsc reports.
+ *
+ * @param[in] address  PCI address of the device.
+ */
+void pci::adoptAddress(const zes_pci_address_t &address)
+{
+	deviceProperties.meiDevicePath.clear();
+	deviceProperties.fwStatus = "unknown";
+	gfxFirmwareQueried = false;
 
-	for (const auto &dv : devicesVec) {
-		if (dv.pciProps.address.domain == deviceProperties.pciProps.address.domain &&
-			dv.pciProps.address.bus == deviceProperties.pciProps.address.bus &&
-			dv.pciProps.address.device == deviceProperties.pciProps.address.device &&
-			dv.pciProps.address.function == deviceProperties.pciProps.address.function) {
-			DBG("Found matching device: {}\n", dv.meiDevicePath.c_str());
+	domain = address.domain;
+	bus = address.bus;
+	dev = address.device;
+	func = address.function;
+	snprintf(bdfStr, sizeof(bdfStr), "%04x:%02x:%02x.%01x", address.domain, address.bus, address.device,
+			 address.function);
 
-			// Found a matching device so copy the meiDevicePath
-			deviceProperties.meiDevicePath = dv.meiDevicePath;
-			deviceProperties.fwStatus = gsc.getGfxFirmwareStatus(dv.meiDevicePath);
-			break;
+	if (auto path = findMeiDevicePath(address)) {
+		DBG("Found matching device: {}\n", path->c_str());
+		deviceProperties.meiDevicePath = std::move(*path);
+	}
+}
+
+/**
+ * @brief Reads the GFX firmware version and status from the device's GSC, once.
+ *
+ * The query opens an IGSC session and asks the GSC firmware for its version, which costs
+ * ~200 ms per device as root on some platforms; doing it on first use rather than in init()
+ * means only callers that need either value pay for it. /dev/mei* is root-only, so
+ * unprivileged callers fail fast.
+ */
+void pci::queryGfxFirmware()
+{
+	if (gfxFirmwareQueried) {
+		return;
+	}
+	gfxFirmwareQueried = true;
+	if (!deviceProperties.meiDevicePath.empty()) {
+		gscupd gsc;
+		auto info = gsc.readGfxFirmware(deviceProperties.meiDevicePath);
+		deviceProperties.fwStatus = std::move(info.status);
+		gfxFwVersion = std::move(info.version);
+	}
+}
+
+/**
+ * @brief Reports the GFX firmware status read from the device's GSC.
+ *
+ * @retval "unknown"  No MEI device matched this GPU, or the GSC could not be queried.
+ * @retval other      The status reported by the GSC firmware.
+ */
+std::string pci::getFWStatus()
+{
+	queryGfxFirmware();
+	return deviceProperties.fwStatus;
+}
+
+/**
+ * @brief Finds the device's largest memory BAR and whether Resizable BAR is on for it.
+ *
+ * @param[in] device Sysman device handle.
+ *
+ * @retval {SUCCESS, bar}                         The largest memory BAR.
+ * @retval {ZE_RESULT_ERROR_UNSUPPORTED_FEATURE}  The device reports no memory BAR.
+ * @retval {Other}                                The error from zesDevicePciGetBars.
+ */
+MemoryBarQuery pci::getMemoryBar(zes_device_handle_t device)
+{
+	uint32_t barCount = 0;
+	ze_result_t result = zesDevicePciGetBars(device, &barCount, nullptr);
+	if (result != ZE_RESULT_SUCCESS) {
+		DBG("Failed to get PCI BAR count: 0x{:X} ({})\n", static_cast<uint32_t>(result), l0_error_to_string(result));
+		return {result, std::nullopt};
+	}
+	std::vector<zes_pci_bar_properties_1_2_t> resizable(barCount);
+	std::vector<zes_pci_bar_properties_t> bars(barCount);
+	for (uint32_t i = 0; i < barCount; ++i) {
+		resizable[i].stype = ZES_STRUCTURE_TYPE_PCI_BAR_PROPERTIES_1_2;
+		bars[i].stype = ZES_STRUCTURE_TYPE_PCI_BAR_PROPERTIES;
+		bars[i].pNext = &resizable[i];
+	}
+	result = zesDevicePciGetBars(device, &barCount, bars.data());
+	if (result != ZE_RESULT_SUCCESS) {
+		DBG("Failed to get PCI BAR properties: 0x{:X} ({})\n", static_cast<uint32_t>(result),
+			l0_error_to_string(result));
+		return {result, std::nullopt};
+	}
+	std::optional<MemoryBar> largest;
+	for (uint32_t i = 0; i < barCount; ++i) {
+		if (bars[i].type == ZES_PCI_BAR_TYPE_MEM && (!largest || bars[i].size > largest->size)) {
+			largest = MemoryBar{.size = bars[i].size,
+								.resizableSupported = resizable[i].resizableBarSupported != 0,
+								.resizableEnabled = resizable[i].resizableBarEnabled != 0};
 		}
 	}
+	if (!largest) {
+		return {ZE_RESULT_ERROR_UNSUPPORTED_FEATURE, std::nullopt};
+	}
+	return {ZE_RESULT_SUCCESS, largest};
+}
 
-	return result;
+/**
+ * @brief Reports the GFX firmware version read directly from the device's GSC.
+ *
+ * Same string as the Level Zero GFX firmware version, without enumerating every firmware
+ * component first.
+ *
+ * @retval std::nullopt No MEI device matched this GPU, or the GSC could not be queried.
+ * @retval version      The GFX firmware version.
+ */
+std::optional<std::string> pci::getGfxFwVersion()
+{
+	queryGfxFirmware();
+	return gfxFwVersion;
 }
 
 /**

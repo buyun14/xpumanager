@@ -9,9 +9,12 @@
 #include <os.h>
 #include <thread>
 #include <chrono>
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <memory>
+#include <array>
+#include <cstring>
 
 // Static member definitions for singleton pattern using smart pointer
 std::unique_ptr<amclib> amcupd::amcobj = nullptr;
@@ -101,9 +104,10 @@ amcupd::~amcupd()
 /*
  * @brief Initialize AMC devices
  *
- * This function initializes the AMC devices by calling the amcInitialize()
- * method of the amclib instance. It ensures that initialization is performed
- * only once across all threads using std::call_once.
+ * This function prepares per-card AMC state by calling the amcInitialize()
+ * method of the amclib instance. It ensures that this is performed only once
+ * across all threads using std::call_once. Each card's I2C device is opened
+ * lazily by amclib the first time that card is used.
  *
  * @return ze_result_t ZE_RESULT_SUCCESS on successful initialization,
  *                     ZE_RESULT_ERROR_UNKNOWN if initialization fails
@@ -218,6 +222,39 @@ int amcupd::amcGetPartNumberByBdf(std::string gpuBDF, std::string &partNum)
 }
 
 /**
+ * @brief Retrieves the FRU serial number for the AMC card associated with a GPU BDF.
+ *
+ * Reads only the serial number, so a failure to read other AMC data (such as the firmware
+ * version) cannot lose it.
+ *
+ * @param[in] gpuBDF PCI BDF string identifying the GPU (e.g. "0000:03:00.0").
+ *
+ * @retval serial  The FRU serial number.
+ * @retval nullopt The AMC subsystem failed to initialize, no AMC belongs to @p gpuBDF, or the
+ *                 serial number could not be read.
+ */
+std::optional<std::string> amcupd::amcGetSerialNumberByBdf(const std::string &gpuBDF)
+{
+	if (init() != ZE_RESULT_SUCCESS) {
+		ERR("Failed to initialize AMC devices before querying serial number\n");
+		return std::nullopt;
+	}
+
+	amclib *amc = getAmcObj();
+	const int idx = amc->amcGetIndex(gpuBDF);
+	if (idx < 0) {
+		return std::nullopt;
+	}
+
+	std::array<char, MAX_PATH> buf{};
+	size_t bufSize = buf.size();
+	if (amc->amcGetSerialNumber(static_cast<uint8_t>(idx), buf.data(), &bufSize) != AMC_SUCCESS) {
+		return std::nullopt;
+	}
+	return std::string(buf.data(), strnlen(buf.data(), buf.size()));
+}
+
+/**
  * @brief Retrieve Thermal Design Power (TDP) for the AMC card associated with a GPU BDF
  *
  * @param [in]  gpuBDF The BDF string of the GPU
@@ -319,20 +356,15 @@ ze_result_t amcupd::updateAMC(firmwareInfo *fwInfo)
 		return ZE_RESULT_ERROR_UNKNOWN;
 	}
 
-	// Set the per-card ForceUpdate flag on the underlying PLDM object.
-	if (amc->amcSetForceUpdate(amcIndex, fwInfo->forceUpdate) != AMC_SUCCESS) {
-		ERR("Failed to configure force-update flag for card {}\n", amcIndex);
-		return ZE_RESULT_ERROR_UNKNOWN;
-	}
-
 	// Shared state for thread coordination
 	std::atomic<bool> flashCompleted{false};
 	std::atomic<bool> flashSuccess{false};
 	std::atomic<bool> stopProgress{false};
 
 	// Create a thread to flash firmware
-	std::thread flashThread([amc, amcIndex, filePath, compIdFilter, &flashCompleted, &flashSuccess]() {
-		int result = amc->amcFirmwareFlash(amcIndex, filePath.c_str(), compIdFilter);
+	const bool forceUpdate = fwInfo->forceUpdate;
+	std::thread flashThread([amc, amcIndex, filePath, compIdFilter, forceUpdate, &flashCompleted, &flashSuccess]() {
+		int result = amc->amcFirmwareFlash(amcIndex, filePath.c_str(), compIdFilter, forceUpdate);
 		flashSuccess.store(result == AMC_SUCCESS);
 		flashCompleted.store(true);
 
@@ -344,30 +376,21 @@ ze_result_t amcupd::updateAMC(firmwareInfo *fwInfo)
 	});
 	// Create a thread to monitor firmware flash progress
 	std::thread progressThread([amc, amcIndex, fwInfo, &flashCompleted, &stopProgress]() {
-		int progress = 0;
-		while (!stopProgress.load() && progress < 100) {
-			progress = amc->amcFirmwareProgress(amcIndex);
+		// The transfer reaching 100% is not the end of the update: verify, apply and activation follow and
+		// can still fail. So the bar stops at 99% while the flash runs; its final state is drawn once both
+		// threads have finished.
+		while (!stopProgress.load() && !flashCompleted.load()) {
+			int progress = amc->amcFirmwareProgress(amcIndex);
 
 			if (progress < 0) {
 				ERR("Failed to get firmware progress for card {}\n", amcIndex);
 				break;
 			}
 
-			if (progress > 100)
-				progress = 100; // Cap at 100%
-
-			SETPROGRESS(fwInfo->deviceIndex, fwInfo->curThread, fwInfo->totalThreads, progress);
-
-			// Exit early if flash completed
-			if (flashCompleted.load()) {
-				SETPROGRESS(fwInfo->deviceIndex, fwInfo->curThread, fwInfo->totalThreads, 100);
-				break;
-			}
+			SETPROGRESS(fwInfo->deviceIndex, fwInfo->curThread, fwInfo->totalThreads, std::min(progress, 99));
 
 			// Add small delay to prevent excessive polling
-			if (progress < 100) {
-				MSLEEP(100);
-			}
+			MSLEEP(100);
 		}
 		DBG("Firmware progress monitoring completed for device {}\n", amcIndex);
 	});
@@ -381,6 +404,12 @@ ze_result_t amcupd::updateAMC(firmwareInfo *fwInfo)
 	stopProgress.store(true);
 	if (progressThread.joinable()) {
 		progressThread.join();
+	}
+
+	// Drawn here rather than by the progress thread, which may stop before seeing the flash end. A failed
+	// flash keeps the progress it had reached.
+	if (flashSuccess.load()) {
+		SETPROGRESS(fwInfo->deviceIndex, fwInfo->curThread, fwInfo->totalThreads, 100);
 	}
 
 	// Return appropriate result based on flash operation success

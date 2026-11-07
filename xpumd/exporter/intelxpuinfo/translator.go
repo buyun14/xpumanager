@@ -15,7 +15,22 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
 
-	pb "github.com/intel/xpumanager/xpumd/exporter/intelxpuinfo/api/deviceinfo/v1alpha1"
+	pb "github.com/intel/xpumanager/xpumd/exporter/intelxpuinfo/api/deviceinfo/v1alpha2"
+)
+
+// Attribute names. Must be in sync with the intelxpu receiver.
+const (
+	hwIDAttribute              = "hw.id"
+	hwParentAttribute          = "hw.parent"
+	hwModelAttribute           = "hw.model"
+	hwStateAttribute           = "hw.state"
+	hwFirmwareVersionAttribute = "hw.firmware_version"
+	hwMemoryLocationAttribute  = "hw.memory.location"
+	hwMemoryTypeAttribute      = "hw.memory.type"
+	pciBDFAttribute            = "pci.bdf"
+	pciDeviceIDAttribute       = "pci.device_id"
+	pciVendorIDAttribute       = "pci.vendor_id"
+	subdeviceIDAttribute       = "com.intel.subdevice_id"
 )
 
 // metricsTranslator translates OpenTelemetry metrics into the gRPC API format.
@@ -81,7 +96,7 @@ func (t *metricsTranslator) fillHealthData() {
 	for id, health := range t.health {
 		resp := t.resp[id]
 		if resp == nil {
-			t.logger.Errorw("no metadata for device, likely not a GPU, skipping...", "hw.id", id)
+			t.logger.Errorw("no metadata for device, likely not a GPU, skipping...", hwIDAttribute, id)
 			continue
 		}
 
@@ -98,7 +113,7 @@ func (t *metricsTranslator) fillMemoryData() {
 	for id, memList := range t.memory {
 		resp := t.resp[id]
 		if resp == nil {
-			t.logger.Errorw("no metadata for device, likely not a GPU, skipping...", "hw.id", id)
+			t.logger.Errorw("no metadata for device, likely not a GPU, skipping...", hwIDAttribute, id)
 			continue
 		}
 
@@ -140,7 +155,7 @@ func (t *metricsTranslator) updateMetadata(metricName string, dps pmetric.Number
 	for _, dp := range dps.All() {
 		attrs := dp.Attributes()
 
-		hwIDVal, _ := attrs.Get("hw.id")
+		hwIDVal, _ := attrs.Get(hwIDAttribute)
 		id := hwIDVal.Str()
 		if id == "" {
 			// Missing hardware ID
@@ -156,14 +171,14 @@ func (t *metricsTranslator) updateMetadata(metricName string, dps pmetric.Number
 			t.resp[id] = resp
 		}
 
-		modelVal, _ := attrs.Get("hw.model")
+		modelVal, _ := attrs.Get(hwModelAttribute)
 
 		resp.Info.Uuid = id
 		resp.Info.Model = modelVal.Str()
 
-		pciDeviceIDVal, _ := attrs.Get("pci.device_id")
-		pciVendorIDVal, _ := attrs.Get("pci.vendor_id")
-		pciBDFVal, _ := attrs.Get("pci.bdf")
+		pciDeviceIDVal, _ := attrs.Get(pciDeviceIDAttribute)
+		pciVendorIDVal, _ := attrs.Get(pciVendorIDAttribute)
+		pciBDFVal, _ := attrs.Get(pciBDFAttribute)
 
 		resp.Info.Pci = &pb.PciInfo{
 			Bdf:      pciBDFVal.Str(),
@@ -171,7 +186,7 @@ func (t *metricsTranslator) updateMetadata(metricName string, dps pmetric.Number
 			VendorId: pciVendorIDVal.Str(),
 		}
 
-		fwVersionVal, _ := attrs.Get("hw.firmware_version")
+		fwVersionVal, _ := attrs.Get(hwFirmwareVersionAttribute)
 		resp.Info.Firmwares = t.parseFirmwares(fwVersionVal.Str())
 	}
 }
@@ -198,12 +213,12 @@ func (t *metricsTranslator) parseFirmwares(fwVersionStr string) []*pb.FirmwareIn
 
 // getParentID returns hw.parent if available, otherwise it fallbacks to hw.id
 func (t *metricsTranslator) getParentID(metricName string, attrs pcommon.Map) string {
-	hwParentVal, _ := attrs.Get("hw.parent")
+	hwParentVal, _ := attrs.Get(hwParentAttribute)
 	id := hwParentVal.Str()
 
 	if id == "" {
 		// Missing or empty hw.parent -> fallback to hw.id
-		hwIDVal, _ := attrs.Get("hw.id")
+		hwIDVal, _ := attrs.Get(hwIDAttribute)
 		id = hwIDVal.Str()
 		if id == "" {
 			// Missing hardware ID
@@ -256,7 +271,7 @@ func (t *metricsTranslator) updateDeviceHealthStatus(statuses healthStatuses, me
 		return
 	}
 
-	hwStateVal, _ := attrs.Get("hw.state")
+	hwStateVal, _ := attrs.Get(hwStateAttribute)
 	hwState := hwStateVal.Str()
 	sm, ok := m.healthStatusFor(hwState)
 	if !ok {
@@ -280,13 +295,11 @@ func (t *metricsTranslator) updateDeviceHealthStatus(statuses healthStatuses, me
 			Reason:   reason,
 			Message:  sm.Message,
 		}
-	} else if sm.severityLevel != pb.SeverityLevel_SEVERITY_LEVEL_OK {
+	} else if sm.severityLevel > status.Severity {
 		// Pick the worst severity level if multiple statuses exist for the same domain
-		if sm.severityLevel > status.Severity {
-			statuses[key].Severity = sm.severityLevel
-			statuses[key].Reason = reason
-			statuses[key].Message = sm.Message
-		}
+		statuses[key].Severity = sm.severityLevel
+		statuses[key].Reason = reason
+		statuses[key].Message = sm.Message
 	}
 }
 
@@ -304,7 +317,7 @@ func (t *metricsTranslator) updateMemoryInfo(metricName string, dps pmetric.Numb
 		attrs := dp.Attributes()
 
 		// Filter for on-device memory only
-		memLocationVal, _ := attrs.Get("hw.memory.location")
+		memLocationVal, _ := attrs.Get(hwMemoryLocationAttribute)
 		if memLocationVal.Str() != "device" {
 			continue
 		}
@@ -330,8 +343,8 @@ func (t *metricsTranslator) updateMemoryInfo(metricName string, dps pmetric.Numb
 			continue
 		}
 
-		memTypeVal, _ := attrs.Get("hw.memory.type")
-		subdeviceIdVal, _ := attrs.Get("subdevice_id")
+		memTypeVal, _ := attrs.Get(hwMemoryTypeAttribute)
+		subdeviceIdVal, _ := attrs.Get(subdeviceIDAttribute)
 
 		t.aggregateMemoryInfo(id, memTypeVal.Str(), subdeviceIdVal.Str(), uint64(size))
 	}

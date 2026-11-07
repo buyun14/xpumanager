@@ -7,7 +7,9 @@ package intelcrashlog
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,7 +22,10 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
 
 	"github.com/intel/xpumanager/xpumd/receiver/intelcrashlog/internal/metadata"
 )
@@ -28,26 +33,50 @@ import (
 // bdfRegexp matches PCI BDF addresses of the form DDDD:BB:DD.F (e.g. 0000:00:1e.2).
 var bdfRegexp = regexp.MustCompile(`(?:^|[^0-9a-zA-Z])([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F])(?:[^0-9a-zA-Z]|$)`)
 
+// attributeKeyReason is the attribute the dropped crashlog counter uses.
+const attributeKeyReason = attribute.Key("reason")
+
+const (
+	reasonTooLarge              = "too_large"
+	reasonTooSmall              = "too_small"
+	reasonFileError             = "file_error"
+	reasonInternalConsumerError = "internal_consumer_error"
+)
+
+var (
+	errFileTooLarge = errors.New("file too large")
+	errFileTooSmall = errors.New("file too small")
+)
+
 type crashlogReceiver struct {
-	config   *Config
-	consumer consumer.Logs
-	logger   *zap.SugaredLogger
+	config    *Config
+	consumer  consumer.Logs
+	logger    *zap.SugaredLogger
+	telemetry *metadata.TelemetryBuilder
 
 	processedFiles  map[string]bool
 	ignoreOlderThan time.Time
 
+	// handle to the watched directory
+	dir     *os.File
 	watcher *fsnotify.Watcher
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 }
 
-func newReceiver(settings receiver.Settings, cfg *Config, nextConsumer consumer.Logs) *crashlogReceiver {
+func newReceiver(settings receiver.Settings, cfg *Config, nextConsumer consumer.Logs) (*crashlogReceiver, error) {
+	telemetry, err := metadata.NewTelemetryBuilder(settings.TelemetrySettings)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create telemetry builder: %w", err)
+	}
+
 	return &crashlogReceiver{
 		config:         cfg,
 		consumer:       nextConsumer,
 		logger:         settings.Logger.Sugar(),
+		telemetry:      telemetry,
 		processedFiles: make(map[string]bool),
-	}
+	}, nil
 }
 
 func (r *crashlogReceiver) Start(_ context.Context, _ component.Host) error {
@@ -61,6 +90,14 @@ func (r *crashlogReceiver) Start(_ context.Context, _ component.Host) error {
 		return fmt.Errorf("failed to watch directory %q: %w", r.config.Directory, err)
 	}
 
+	// NOTE: clean the path like fsnotify does so that both refer to the same dir
+	dir, err := os.OpenFile(filepath.Clean(r.config.Directory), os.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		_ = watcher.Close()
+		return fmt.Errorf("failed to open directory %q: %w", r.config.Directory, err)
+	}
+
+	r.dir = dir
 	r.watcher = watcher
 	r.ignoreOlderThan = time.Now().Add(-r.config.IgnoreOlderThan)
 
@@ -69,7 +106,10 @@ func (r *crashlogReceiver) Start(_ context.Context, _ component.Host) error {
 	r.cancel = cancel
 
 	r.wg.Go(func() {
-		defer func() { _ = watcher.Close() }()
+		defer func() {
+			_ = watcher.Close()
+			_ = dir.Close()
+		}()
 		r.run(ctx)
 	})
 
@@ -81,6 +121,7 @@ func (r *crashlogReceiver) Shutdown(_ context.Context) error {
 		r.cancel()
 	}
 	r.wg.Wait()
+	r.telemetry.Shutdown()
 	return nil
 }
 
@@ -114,6 +155,12 @@ func (r *crashlogReceiver) run(ctx context.Context) {
 				return
 			}
 			r.logger.Warnw("watcher error", "error", err)
+			// Events were lost, rescan to pick up any missed files
+			if errors.Is(err, fsnotify.ErrEventOverflow) {
+				if err := r.scanDirectory(ctx); err != nil {
+					r.logger.Errorw("directory rescan failed", "directory", r.config.Directory, "error", err)
+				}
+			}
 		}
 	}
 }
@@ -157,9 +204,27 @@ func (r *crashlogReceiver) handlePath(ctx context.Context, path string) {
 		return
 	}
 
-	info, err := os.Lstat(path)
+	// Open relative to the watched directory. Use fd (across stat and read) to avoid TOCTOU issues.
+	fd, err := unix.Openat(int(r.dir.Fd()), filepath.Base(path), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ELOOP) {
+		r.logger.Debugw("skipping symlink", "path", path)
+		return
+	}
+	if err != nil {
+		r.logger.Errorw("failed to open file", "path", path, "error", err)
+		// A vanished file is not a dropped crashlog
+		if !errors.Is(err, unix.ENOENT) {
+			r.recordDropped(ctx, reasonFileError)
+		}
+		return
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
 	if err != nil {
 		r.logger.Errorw("failed to stat file", "path", path, "error", err)
+		r.recordDropped(ctx, reasonFileError)
 		return
 	}
 	if !info.Mode().IsRegular() {
@@ -177,14 +242,33 @@ func (r *crashlogReceiver) handlePath(ctx context.Context, path string) {
 		return
 	}
 
-	r.emitFile(ctx, path, info)
+	if info.Size() > r.config.MaxFileSize {
+		r.logger.Warnw("skipping too large crashlog", "path", path, "size", info.Size(), "maxFileSize", r.config.MaxFileSize)
+		r.recordDropped(ctx, reasonTooLarge)
+		return
+	}
+	if info.Size() < r.config.MinFileSize {
+		r.logger.Warnw("skipping too small crashlog", "path", path, "size", info.Size(), "minFileSize", r.config.MinFileSize)
+		r.recordDropped(ctx, reasonTooSmall)
+		return
+	}
+
+	r.emitFile(ctx, path, f, info)
 }
 
-// emitFile reads the crashlog file and emits a log record.
-func (r *crashlogReceiver) emitFile(ctx context.Context, path string, info os.FileInfo) {
-	data, err := os.ReadFile(path)
+// emitFile reads the opened crashlog file and emits a log record.
+func (r *crashlogReceiver) emitFile(ctx context.Context, path string, f *os.File, info os.FileInfo) {
+	data, err := r.readFile(f, info.Size())
 	if err != nil {
 		r.logger.Errorw("failed to read crashlog", "path", path, "error", err)
+		switch {
+		case errors.Is(err, errFileTooLarge):
+			r.recordDropped(ctx, reasonTooLarge)
+		case errors.Is(err, errFileTooSmall):
+			r.recordDropped(ctx, reasonTooSmall)
+		default:
+			r.recordDropped(ctx, reasonFileError)
+		}
 		return
 	}
 	r.processedFiles[path] = true
@@ -197,7 +281,7 @@ func (r *crashlogReceiver) emitFile(ctx context.Context, path string, info os.Fi
 
 	lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(time.Now()))
 	lr.SetTimestamp(pcommon.NewTimestampFromTime(info.ModTime()))
-	lr.Body().SetEmptyBytes().FromRaw(data)
+	data.MoveTo(lr.Body().SetEmptyBytes())
 
 	attrs := lr.Attributes()
 	attrs.PutStr("file.name", filepath.Base(path))
@@ -212,9 +296,41 @@ func (r *crashlogReceiver) emitFile(ctx context.Context, path string, info os.Fi
 
 	if err := r.consumer.ConsumeLogs(ctx, logs); err != nil {
 		r.logger.Errorw("failed to emit crashlog", "path", path, "error", err)
+		r.recordDropped(ctx, reasonInternalConsumerError)
 	} else {
 		r.logger.Debugw("emitted crashlog", "path", path, "attributes", attrs)
 	}
+}
+
+// readFile reads the contents of a file directly into a pcommon.ByteSlice (avoiding a copy of the data on emit).
+func (r *crashlogReceiver) readFile(f *os.File, size int64) (pcommon.ByteSlice, error) {
+	data := pcommon.NewByteSlice()
+	data.EnsureCapacity(int(size))
+
+	// Read one byte more than the limit to detect growth past it
+	n, err := io.Copy(byteSliceWriter(data), io.LimitReader(f, r.config.MaxFileSize+1))
+	if err != nil {
+		return data, err
+	}
+	if n > r.config.MaxFileSize {
+		return data, fmt.Errorf("file grew past the size limit of %d bytes: %w", r.config.MaxFileSize, errFileTooLarge)
+	}
+	if n < r.config.MinFileSize {
+		return data, fmt.Errorf("file shrank below the size limit of %d bytes: %w", r.config.MinFileSize, errFileTooSmall)
+	}
+	return data, nil
+}
+
+func (r *crashlogReceiver) recordDropped(ctx context.Context, reason string) {
+	r.telemetry.CrashlogsDropped.Add(ctx, 1, metric.WithAttributes(attributeKeyReason.String(reason)))
+}
+
+// byteSliceWriter is a wrapper around pcommon.ByteSlice that implements io.Writer.
+type byteSliceWriter pcommon.ByteSlice
+
+func (w byteSliceWriter) Write(p []byte) (int, error) {
+	pcommon.ByteSlice(w).Append(p...)
+	return len(p), nil
 }
 
 // parseBDF extracts the PCI BDF address found in string or returns an empty string.

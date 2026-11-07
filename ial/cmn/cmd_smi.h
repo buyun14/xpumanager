@@ -9,9 +9,11 @@
 
 #include "proc_fdinfo.h"
 #include "cmds.h"
+#include "cmd_ps.h"
 #include "table_builder.h"
 #include <enginegroup.h>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <map>
 #include <cstdint>
@@ -27,8 +29,8 @@ struct SmiBaseline
 	// engine util: one busyness counter reading per engine group the device exposes
 	std::vector<EngineActivitySample> engineActivity;
 
-	// engine util from fdinfo instead, where sysman engine counters aren't allowed
-	std::vector<fdinfo::ProcessSnapshot> fdinfoSnap;
+	// engine util from fdinfo instead, where sysman engine counters aren't allowed; the
+	// snapshots are taken once for all devices by collectAndRender()
 	bool useFdinfo = false;
 };
 
@@ -86,6 +88,18 @@ public:
 	int run(arg_struct *args);
 	std::pair<ze_result_t, std::string> collectAndRender(arg_struct *args);
 
+	/// --all: keep the idle runtime contexts a multi-GPU process holds on GPUs it is not
+	/// using in the process table, as "ps --all" does.
+	bool showAll = false;
+
+	// Pure helpers for the GPU table and its Name slot. Public so the layout can be unit
+	// tested without a GPU: they read nothing but their arguments.
+	[[nodiscard]] static std::string shortDeviceName(std::string_view deviceName);
+	[[nodiscard]] static std::vector<std::string> wrapDeviceName(std::string_view deviceName, size_t width);
+	[[nodiscard]] static TableBuilder buildGpuTable(const std::vector<SmiDeviceStats> &devStats,
+													const std::string &lzVersion);
+	static void applyFdinfoUtil(SmiDeviceStats &stats, const ProcUtil &util);
+
 private:
 	static void collectStaticProps(SmiDeviceStats &stats, devInfo *dev);
 	static void collectFan(SmiDeviceStats &stats, devInfo *dev);
@@ -95,9 +109,8 @@ private:
 	static void captureBaseline(SmiBaseline &baseline, devInfo *dev);
 	static void computeFromBaseline(SmiDeviceStats &stats, const SmiBaseline &baseline, devInfo *dev);
 
-	[[nodiscard]] static TableBuilder buildGpuTable(const std::vector<SmiDeviceStats> &devStats,
-													const std::string &lzVersion);
-	[[nodiscard]] static TableBuilder buildProcessTable(const std::vector<devInfo> &deviceList);
+	[[nodiscard]] static TableBuilder buildProcessTable(const std::vector<devInfo> &deviceList,
+														const std::vector<std::vector<psInfo>> &procsPerDevice);
 };
 
 #endif

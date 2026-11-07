@@ -588,6 +588,36 @@ ze_result_t device::getCacheProps(ze_device_handle_t dev, ze_device_cache_proper
 }
 
 /**
+ * @brief Resets a device that Level Zero does not report, through the PCI reset sysfs attribute.
+ *
+ * The recovery the xe driver documents for a wedged device: the kernel resets the
+ * function and the driver re-probes it.
+ *
+ * @retval ZE_RESULT_SUCCESS                    The kernel accepted the reset.
+ * @retval ZE_RESULT_ERROR_UNSUPPORTED_FEATURE  No method can reset this function alone.
+ * @retval ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS  The reset attribute is root-only.
+ * @retval ZE_RESULT_ERROR_UNKNOWN              The kernel refused the reset.
+ */
+ze_result_t device::resetThroughPci()
+{
+	TRACING();
+	const std::string bdf = pciInstance.getBDFStr();
+	const std::error_code ec = resetPciFunction(bdf);
+	if (!ec) {
+		DBG("PCI function reset of {} accepted.\n", bdf);
+		return ZE_RESULT_SUCCESS;
+	}
+	ERR("PCI function reset of {} failed: {}\n", bdf, ec.message());
+	if (ec == std::errc::not_supported) {
+		return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+	}
+	if (ec == std::errc::permission_denied || ec == std::errc::operation_not_permitted) {
+		return ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS;
+	}
+	return ZE_RESULT_ERROR_UNKNOWN;
+}
+
+/**
  * @brief Resets a Level Zero device.
  *
  * This function resets a Level Zero device.
@@ -598,6 +628,9 @@ ze_result_t device::getCacheProps(ze_device_handle_t dev, ze_device_cache_proper
  */
 ze_result_t device::resetDevice(zes_device_handle_t dev)
 {
+	if (isPciOnly()) {
+		return resetThroughPci();
+	}
 	ze_result_t result = zesDeviceReset(dev, true);
 	if (result != ZE_RESULT_SUCCESS) {
 		ERR("Failed to reset device: 0x{:X} ({})\n", result, l0_error_to_string(result));
@@ -738,6 +771,98 @@ ze_result_t device::zesGetDevProps(zes_device_handle_t dev, zes_device_propertie
 	DBG("  - Driver Version: {}\n", zesDevProp->driverVersion);
 
 	return result;
+}
+
+/**
+ * @brief Reads why, if at all, the device needs a reset to keep working.
+ *
+ * @param[out] reasons Set to the reasons the driver reports: none, wedged, or a repair that
+ *                     needs a reset. Unchanged on failure.
+ *
+ * @retval ZE_RESULT_SUCCESS               The reasons were read.
+ * @retval ZE_RESULT_ERROR_UNINITIALIZED   The device has no Sysman handle.
+ * @retval Other                           The error from zesDeviceGetState().
+ */
+ze_result_t device::getResetReasons(zes_reset_reason_flags_t &reasons)
+{
+	if (zesDevice == nullptr) {
+		return ZE_RESULT_ERROR_UNINITIALIZED;
+	}
+	zes_device_state_t state{};
+	state.stype = ZES_STRUCTURE_TYPE_DEVICE_STATE;
+	const ze_result_t result = zesDeviceGetState(zesDevice, &state);
+	if (result != ZE_RESULT_SUCCESS) {
+		DBG("Failed to get device state: 0x{:X} ({})\n", result, l0_error_to_string(result));
+		return result;
+	}
+	reasons = state.reset;
+	return ZE_RESULT_SUCCESS;
+}
+
+/**
+ * @brief Reports whether the device has had a repair performed, e.g. memory remapping.
+ *
+ * @param[out] status ZES_REPAIR_STATUS_UNSUPPORTED, _NOT_PERFORMED or _PERFORMED.
+ *
+ * @retval ZE_RESULT_SUCCESS             @p status was written.
+ * @retval ZE_RESULT_ERROR_UNINITIALIZED The device has no Sysman handle.
+ * @retval Other                         The error from zesDeviceGetState.
+ */
+ze_result_t device::getRepairStatus(zes_repair_status_t &status)
+{
+	if (zesDevice == nullptr) {
+		return ZE_RESULT_ERROR_UNINITIALIZED;
+	}
+	zes_device_state_t state{};
+	state.stype = ZES_STRUCTURE_TYPE_DEVICE_STATE;
+	const ze_result_t result = zesDeviceGetState(zesDevice, &state);
+	if (result != ZE_RESULT_SUCCESS) {
+		DBG("Failed to get device state: 0x{:X} ({})\n", result, l0_error_to_string(result));
+		return result;
+	}
+	status = state.repaired;
+	return ZE_RESULT_SUCCESS;
+}
+
+/**
+ * @brief Reads the performance factor of the device-level domain covering @p engines.
+ *
+ * The factor (0-100) says how the hardware trades frequency between engine types; 50 is balanced.
+ *
+ * @param[in]  engines The engine type, e.g. ZES_ENGINE_TYPE_FLAG_COMPUTE.
+ * @param[out] factor  Receives the factor.
+ *
+ * @retval ZE_RESULT_SUCCESS                   @p factor was written.
+ * @retval ZE_RESULT_ERROR_UNINITIALIZED       The device has no Sysman handle.
+ * @retval ZE_RESULT_ERROR_UNSUPPORTED_FEATURE No performance factor domain covers @p engines.
+ * @retval Other                               The error from the performance factor calls.
+ */
+ze_result_t device::getPerformanceFactor(zes_engine_type_flags_t engines, double &factor)
+{
+	if (zesDevice == nullptr) {
+		return ZE_RESULT_ERROR_UNINITIALIZED;
+	}
+	uint32_t count = 0;
+	ze_result_t result = zesDeviceEnumPerformanceFactorDomains(zesDevice, &count, nullptr);
+	if (result != ZE_RESULT_SUCCESS || count == 0) {
+		DBG("No performance factor domains. 0x{:X} ({})\n", static_cast<uint32_t>(result), l0_error_to_string(result));
+		return result != ZE_RESULT_SUCCESS ? result : ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+	}
+	std::vector<zes_perf_handle_t> domains(count);
+	result = zesDeviceEnumPerformanceFactorDomains(zesDevice, &count, domains.data());
+	if (result != ZE_RESULT_SUCCESS) {
+		return result;
+	}
+	for (auto *domain : domains) {
+		zes_perf_properties_t properties{};
+		properties.stype = ZES_STRUCTURE_TYPE_PERF_PROPERTIES;
+		if (zesPerformanceFactorGetProperties(domain, &properties) != ZE_RESULT_SUCCESS || properties.onSubdevice ||
+			(properties.engines & engines) == 0) {
+			continue;
+		}
+		return zesPerformanceFactorGetConfig(domain, &factor);
+	}
+	return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
 }
 
 /**
@@ -909,6 +1034,29 @@ ze_result_t device::init(ze_driver_handle_t zeD, zes_driver_handle_t zesD, ze_de
 		return ZE_RESULT_ERROR_INVALID_ENUMERATION;
 	}
 	return ZE_RESULT_SUCCESS;
+}
+
+/**
+ * @brief Initializes a device that Level Zero does not report, from its PCI address alone.
+ *
+ * For recovery when the driver finds no usable GPU, or not this one: there is
+ * no core or sysman handle, so only operations that need neither work - PCI
+ * function reset and cold reset through sysfs.
+ *
+ * @param[in] address  PCI address of the device.
+ */
+void device::pciOnlyInit(const zes_pci_address_t &address)
+{
+	TRACING();
+	pciOnly = true;
+	pciInstance.initFromAddress(address);
+	// Commands that refuse an iGPU must still see one: resetting it takes the host display down.
+	igpu = isRootComplexIntegrated(pciInstance.getBDFStr());
+	amc = -1;
+	const std::string drmPath = GETDRMPATH(pciInstance.getBDFStr());
+	if (!drmPath.empty()) {
+		STRCPY_S(drmDevPath, sizeof(drmDevPath), drmPath.c_str());
+	}
 }
 
 /**

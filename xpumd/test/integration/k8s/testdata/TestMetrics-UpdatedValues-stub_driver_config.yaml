@@ -10,6 +10,8 @@ Drivers:
         Version: 65536
       - Name: "ZES_extension_device_health"
         Version: 65536
+      - Name: "ZES_extension_oem_serial_id"
+        Version: 65536
     Devices:
       - Properties:
           Core:
@@ -21,7 +23,8 @@ Drivers:
           NumSubdevices: 2
           ModelName: "Super 3000"
           VendorName: "ACME Inc."
-          SerialNumber: "SN-0001"
+          SerialNumber: "unknown"
+          OemSerialId: "OEM-0001"
           Flags: 1  # ZES_DEVICE_PROPERTY_FLAG_INTEGRATED
 
         State:
@@ -87,6 +90,42 @@ Drivers:
             Activity:
               ActiveTime: 300000
               Timestamp: 2000000
+
+        Fans:
+          - Properties:
+              OnSubdevice: false
+              SubdeviceId: 0
+              CanControl: true
+              SupportedModes: 7 # ZES_FAN_SPEED_MODE_DEFAULT | ZES_FAN_SPEED_MODE_FIXED | ZES_FAN_SPEED_MODE_TABLE
+              SupportedUnits: 3 # ZES_FAN_SPEED_UNITS_RPM | ZES_FAN_SPEED_UNITS_PERCENT
+              MaxRPM: 3000
+              MaxPoints: 16
+            Config:
+              Mode: 2 # ZES_FAN_SPEED_MODE_TABLE
+              SpeedTable:
+                NumPoints: 5
+                Table:
+                  - Temperature: 40
+                    Speed:
+                      Speed: 0
+                      Units: 0 # ZES_FAN_SPEED_UNITS_RPM
+                  - Temperature: 50
+                    Speed:
+                      Speed: 750
+                      Units: 0 # ZES_FAN_SPEED_UNITS_RPM
+                  - Temperature: 60
+                    Speed:
+                      Speed: 1500
+                      Units: 0 # ZES_FAN_SPEED_UNITS_RPM
+                  - Temperature: 70
+                    Speed:
+                      Speed: 2250
+                      Units: 0 # ZES_FAN_SPEED_UNITS_RPM
+                  - Temperature: 80
+                    Speed:
+                      Speed: 3000
+                      Units: 0 # ZES_FAN_SPEED_UNITS_RPM
+            Speed: 2250
 
         FrequencyDomains:
           - Properties:
@@ -163,6 +202,30 @@ Drivers:
                 Interval: 1000
                 LimitValueLocked: false
                 Limit: 200000
+          - Properties:
+              OnSubdevice: false
+              SubdeviceId: 0
+              CanControl: true
+              IsEnergyThresholdSupported: true
+              ExtendedProperties:
+                Domain: 1  # ZES_POWER_DOMAIN_CARD
+                DefaultLimit:
+                  Enabled: true
+                  Limit: 550000
+            EnergyCounter:
+              Energy: 665000000
+              # 1 s later than the initial config: 660 J over 1 s -> 660 W
+              Timestamp: 2000000
+            LimitsExt:
+              - Level: 1  # ZES_POWER_LEVEL_SUSTAINED
+                Source: 0  # ZES_POWER_SOURCE_ANY
+                LimitUnit: 2  # ZES_LIMIT_UNIT_POWER
+                EnabledStateLocked: false
+                Enabled: true
+                IntervalValueLocked: false
+                Interval: 1000
+                LimitValueLocked: false
+                Limit: 600000
 
         RasErrorSets:
           - Properties:
@@ -206,4 +269,4 @@ Drivers:
               MaxTemperature: 100.0
               IsThreshold1Supported: true
               IsThreshold2Supported: true
-            Temperature: 90.0  # above 85 °C threshold → warning
+            Temperature: 105.0  # above 100 °C default threshold → critical

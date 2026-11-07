@@ -14,6 +14,7 @@ defined in the OpenTelemetry specification.
 **Key features:**
 - Transforms component metrics (e.g., temperature or utilization) into (health) status metrics
 - Two-level hierarchical component relationships (e.g., temperature sensor -> GPU device)
+- Aggregation of multiple data points before status evaluation
 - Flexible rule-based evaluation of status/state evaluation
 
 ## Configuration
@@ -44,6 +45,9 @@ processors:
         parent_filters:
           - key: "hw.type"
             values: ["memory"]
+        aggregate:
+          function: "Max"
+          group_by: ["hw.id"]
         states:
           - state_name: "ok"
           - state_name: "warning"
@@ -74,7 +78,8 @@ processors:
 | `copy_attributes` | []string | [] | List of attributes to copy from `source_metric` to `status_metric` |
 | `add_attributes` | map[string]string | {} | Additional attributes to set on the `status_metric` |
 | `component_filters` | []AttributeFilter | [] | Filters to apply on the source metric |
-| `parent_filters` | []AttributeFilter | [] | Filters to apply on the parent metric |
+| `parent_filters` | []AttributeFilter | [] | Filters to apply on the parent metric. Requires `parent_metric` |
+| `aggregate` | AggregateRule | none | Aggregate the filtered `source_metric` data points before evaluating the states. If not set, each data point is evaluated separately |
 | `states` | []StateRule | *required* | Ordered list of state rules to evaluate. All rules are evaluated, and the last matching one will be active. Thus, the rules should be ordered by increasing severity |
 
 #### AttributeFilter
@@ -88,7 +93,27 @@ component_filters:
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `key` | string | Attribute key to filter on |
-| `values` | []string | Attribute values to match (logical OR) |
+| `operator` | string | `In` (default): attribute exists and its value is one of `values`. `NotIn`: attribute is missing or its value is none of `values` |
+| `values` | []string | Attribute values to match against. At least one is required |
+
+#### AggregateRule
+
+```yaml
+aggregate:
+  function: "Sum"
+  group_by: ["hw.id"]
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `function` | string | Aggregate function: `Sum`, `Min` or `Max` |
+| `group_by` | []string | Attributes of the `source_metric` to group the data points by. Data points are also implicitly grouped by their parent (`parent_ref_attribute`) |
+
+Each group produces one set of status data points, with the latest timestamp
+of the group. The `group_by` attributes and the `parent_ref_attribute` are
+implicitly copied to the status data points. Of the `copy_attributes`, only
+those that are identical within the group are copied, others are set to an
+empty value.
 
 #### StateRule
 
@@ -105,14 +130,14 @@ states:
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `state_name` | string | Value to set to the state attribute (`state_attribute`) of the generated metric (`status_metric`) |
-| `conditions` | []ConditionRule | Conditions to evaluate to apply this state. A logical OR is applied i.e. the rule matches if any of the conditions match. Empty list means always match |
+| `conditions` | []ConditionRule | Conditions to evaluate on whether to apply this state. First condition with a matching `parent_filters` is used for evaluating the threshold value. Empty list means always match. Default (no `parent_filters`) threshold should be the last one (this avoids overriding higher thresholds with more specific conditions) |
 
 #### ConditionRule
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `value` | float64 | Value threshold. Condition matches if metric value >= threshold |
-| `parent_filters` | []AttributeFilter | Filter to apply on parent attributes |
+| `parent_filters` | []AttributeFilter | Filter to apply on parent attributes. Requires `parent_metric` |
 
 ### Example Configuration
 
@@ -160,7 +185,7 @@ processors:
               - value: 95.0
 ```
 
-For a `hw.temperature` metric  with a value 87.0 C you would get:
+For a `hw.temperature` metric with a value 87.0 C you would get:
 
 ```
 hw.status{hw.id="mem0", hw.type="memory", hw.category="thermal", hw.state="ok"} 0
@@ -170,12 +195,44 @@ hw.status{hw.id="mem0", hw.type="memory", hw.category="thermal", hw.state="criti
 
 The processor generates data points for **all defined states**, with value 1 for the active state and 0 for inactive states.
 
+### Aggregation Example
+
+Evaluate the total power usage of all sub-devices of a GPU, instead of each
+sub-device power domain separately:
+
+```yaml
+processors:
+  intel_xpu_status:
+    rules:
+      - name: "Sub-devices total power usage"
+        source_metric: "hw.power"
+        parent_metric: "hw.gpu.info"
+        parent_ref_attribute: "hw.id"
+        # Sub-device power domains only
+        component_filters:
+          - key: "com.intel.subdevice_id"
+            operator: "NotIn"
+            values: [""]
+        aggregate:
+          function: "Sum"
+          group_by: ["hw.id"]
+        copy_attributes: ["hw.id", "pci.bdf"]
+        add_attributes:
+          hw.type: "gpu"
+          hw.sensor_location: "subdevices"
+        states:
+          - state_name: "ok"
+          - state_name: "warning"
+            conditions:
+              - value: 300
+```
+
 ## Metrics processing
 
 The following diagram illustrates how attributes flow from source and parent metrics to the generated status metric:
 
 ```mermaid
-graph TB
+graph LR
     subgraph SourceMetric["Source Metric (hw.temperature)"]
         S1["hw.id: 1234-56<br/>hw.name: temp0<br/>hw.parent: 1234<br/>statistic: max<br/>value: 85.0"]
     end
@@ -185,11 +242,14 @@ graph TB
     end
 
     subgraph Processing["Processing Steps"]
+        direction TB
         F1["Apply component_filters"]
         F2["Apply parent_filters"]
+        FA["Aggregate data points<br/>(aggregate)"]
         F3["Copy selected attributes<br/>(copy_attributes)"]
         F4["Add static attributes<br/>(add_attributes)"]
         F5["Evaluate state rules"]
+        F1 --> F2 --> FA --> F3 --> F4 --> F5
     end
 
     subgraph StatusMetric["Status Metric (hw.status)"]
@@ -197,13 +257,9 @@ graph TB
     end
 
     S1 -->|"References via<br/>hw.parent"| P1
-    S1 --> F1
-    P1 --> F2
-    F1 --> F3
-    F2 --> F5
-    F3 --> F4
-    F4 --> F5
-    F5 --> O1
+    SourceMetric --> Processing
+    ParentMetric --> Processing
+    Processing --> StatusMetric
 
     style SourceMetric fill:#e1f5ff
     style ParentMetric fill:#fff4e1

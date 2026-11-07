@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	pb "github.com/intel/xpumanager/xpumd/exporter/intelxpuinfo/api/deviceinfo/v1alpha1"
+	pb "github.com/intel/xpumanager/xpumd/exporter/intelxpuinfo/api/deviceinfo/v1alpha2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.yaml.in/yaml/v4"
@@ -255,6 +255,7 @@ func TestSysmanErrors(t *testing.T) {
 			// gpu-1: nothing but the device properties is available
 			"Failed to enumerate Sysman engine groups",
 			"Failed to enumerate firmwares",
+			"Failed to enumerate device fans",
 			"Failed to enumerate frequency domains",
 			"Failed to enumerate memory modules",
 			"Failed to enumerate power domains",
@@ -378,6 +379,32 @@ func TestXpuinfo(t *testing.T) {
 		}
 		assert.Empty(t, cmp.Diff(want, &resp, protocmp.Transform()), "event response mismatch (-want +got)")
 	})
+
+	t.Run("InfoLogEvents", func(t *testing.T) {
+		// Load stub config before starting the client to clears events from previous subtest
+		tc.loadStubDriverConfig(t)
+		logs := tc.runXpuinfoCLI(context.Background(), t, "xpuinfo-cli-infolog-events",
+			[]string{"--no-health", "--oneshot"}, nil)
+
+		var resp pb.DeviceEventResponse
+		require.NoError(t, yaml.Unmarshal([]byte(logs), &resp), "unmarshal event response\nlogs:\n%s", logs)
+
+		want := &pb.DeviceEventResponse{
+			Device: &pb.DeviceIdentification{
+				Uuid:  "12345678-0000-0000-0000-000000000000",
+				Model: "Super 3000",
+				Pci: &pb.PciInfo{
+					Bdf:      "0000:05:00.0",
+					DeviceId: "0bd5",
+					VendorId: "8086",
+				},
+			},
+			Reason:   "info_log.cper",
+			Message:  "binary record, 18 bytes", // "CPER-RECORD-DEVICE"
+			Severity: pb.EventSeverityLevel_EVENT_SEVERITY_LEVEL_ERROR,
+		}
+		assert.Empty(t, cmp.Diff(want, &resp, protocmp.Transform()), "event response mismatch (-want +got)")
+	})
 }
 
 // TestCrashlog verifies the intel_crashlog receiver.
@@ -417,6 +444,19 @@ func TestCrashlog(t *testing.T) {
 		_, hasBDF := rec.Attributes["pci.bdf"]
 		assert.False(t, hasBDF, "pci.bdf attribute should be omitted when filename has no BDF")
 		assert.Equal(t, crashlogData, rec.Body, "crashlog record body mismatch")
+	})
+
+	t.Run("DropTooLargeFile", func(t *testing.T) {
+		const name = "too-large.crashlog"
+		ch.writeCrashlogFile(t, make([]byte, 129), name) // max_file_size is 128 in the helm values
+
+		tunnel := tc.forwardPort(t, 8888)
+		t.Cleanup(tunnel.stop)
+		metricAssertion{
+			Name:   "otelcol_crashlogs_dropped",
+			Labels: labels{"reason": "too_large"},
+			Value:  new(1.0),
+		}.waitFor(t, tunnel.endpoint(), 30*time.Second)
 	})
 }
 

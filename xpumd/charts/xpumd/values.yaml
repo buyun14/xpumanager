@@ -53,6 +53,18 @@ podSecurityContextOverride: {}
 # NOTE: security settings control to what GPU metrics container has access to
 securityContextOverride: {}
 
+# @schema $ref: $k8s/_definitions.json#/definitions/io.k8s.api.core.v1.Probe; skipProperties: true
+# -- [Readiness probe](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/) of the xpumd container. NOTE: requires the `health_check` extension to be enabled in `config.service.extensions`
+readinessProbe:
+  httpGet:
+    path: /
+    port: health
+  periodSeconds: 5
+
+# @schema $ref: $k8s/_definitions.json#/definitions/io.k8s.api.core.v1.Probe; skipProperties: true
+# -- [Liveness probe](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/) of the xpumd container. NOTE: requires the `health_check` extension to be enabled in `config.service.extensions`
+livenessProbe: {}
+
 # @schema $ref: $k8s/_definitions.json#/definitions/io.k8s.api.core.v1.PodSpec/properties/initContainers
 # -- Init containers to run
 initContainers: []
@@ -161,6 +173,10 @@ config:
       # -- Configuration for enabling/disabling individual metrics.
       # @section -- XPUM Daemon Configuration
       metrics: {}
+      # -- Configuration for enabling/disabling metric subsystems, all enabled by default,
+      # see the `intel_xpu` README for details.
+      # @section -- XPUM Daemon Configuration
+      subsystems: {}
     # -- Override configuration for the Intel Crashlog receiver. Should only be used for advanced use cases.
     # See `intel_crashlog` README for details.
     # @section -- XPUM Daemon Configuration
@@ -188,6 +204,12 @@ config:
   # @default --  
   # @section -- XPUM Daemon Configuration
   extensions:
+    # Bound to all IPs, as the kubelet probes the pod IP
+    # @schema hidden
+    # -- Configuration for the [Health Check extension](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/extension/healthcheckextension).
+    # @section -- XPUM Daemon Configuration
+    health_check:
+      endpoint: "0.0.0.0:13133"
     # @schema additionalProperties:false
     # -- Configuration for the Intel device watch extension. It detects GPUs that
     # appeared or disappeared after the L0 Sysman API was initialized, which the
@@ -242,7 +264,7 @@ config:
   service:
     # -- Extensions to enable
     # @section -- XPUM Daemon Configuration
-    extensions: [intel_device_watch]
+    extensions: [health_check, intel_device_watch]
     # @schema hidden
     telemetry:
       logs:

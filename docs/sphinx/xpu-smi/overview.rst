@@ -8,7 +8,8 @@ management for Intel(R) Arc Pro Series GPUs.
 Global Options
 --------------
 
-These options are available at the top level (without a subcommand):
+These options are available at the top level (without a subcommand), except
+``--timeout``, which applies to every command and may appear anywhere on the command line:
 
 .. option:: -h, --help
 
@@ -21,6 +22,11 @@ These options are available at the top level (without a subcommand):
 .. option:: --list-gpus
 
    Print one line per GPU (index, name, UUID) and exit.
+
+.. option:: --all
+
+   In the default output, also list the idle runtime contexts a multi-GPU process holds
+   on GPUs it is not using, as ``xpu-smi ps --all`` does. Can be combined with ``--loop``.
 
 .. option:: --query-gpu=<fields>
 
@@ -54,23 +60,50 @@ These options are available at the top level (without a subcommand):
 
       Redirect output to a file instead of stdout.
 
+.. option:: --timeout=<sec>, --timeout <sec>
+
+   Abort if ``xpu-smi`` makes no progress for ``<sec>`` seconds (default: ``30``), for
+   example because a driver call does not return. ``0`` turns the timeout off; the maximum
+   is ``86400``. Time spent waiting between samples (``--loop``, ``dump -i``, ``stats``)
+   does not count, so long-running loops are not affected.
+
+   After half the timeout without progress, a warning on stderr names the phase that is
+   stuck (for example ``driver init``) and how many seconds remain. On timeout, ``xpu-smi``
+   restores the terminal, prints the phase and one line per thread to stderr, and exits
+   with code ``124``.
+
+   The timeout is suspended while firmware is being written (``updatefw``): a flash can take
+   several minutes, and interrupting one can leave the card unusable. It starts again,
+   with the full timeout, once flashing ends.
+
 Synopsis
 --------
 
 .. code-block:: text
 
    xpu-smi [Options]
+   xpu-smi [--all] [--loop[=<sec>]|--loop-ms=<ms>] [--count=<n>]
    xpu-smi -v
    xpu-smi -h
    xpu-smi --list-gpus
    xpu-smi --query-gpu=<fields> [--id <n>] [--loop[=<sec>]|--loop-ms=<ms>] [--count=<n>] [--format=csv[,...]]
    xpu-smi <command> [command-options]
+   xpu-smi [--timeout=<sec>] ...
 
 Default Output
 --------------
 
 Running ``xpu-smi`` with no arguments displays a GPU status summary of all detected devices,
 followed by the processes using them.
+
+``Name`` is the device name the driver reports, without the words that every Intel device
+name shares: the trademark signs, a leading ``Intel`` (kept when only ``Graphics`` or ``GPU``
+would be left), a ``Data Center GPU`` prefix and a trailing ``Graphics`` or ``GPU`` after the
+model number. So ``Intel(R) Arc(TM) Pro B60 Graphics`` shows as ``Arc Pro B60``, and a name
+still too long for the column wraps at a space. A driver
+that has no product name for a device reports ``Intel(R) Graphics [0x<PCI device ID>]``, shown as
+``Graphics [0x<PCI device ID>]``; a newer driver may name it. :doc:`discovery` and
+``--query-gpu=name`` show the full name.
 
 ``GPU-Util`` is the utilization of the busiest engine on the device: the fraction of the
 sample window during which that engine was executing work. It is not the average across
@@ -203,7 +236,7 @@ metric category. Run ``xpu-smi --query-gpu`` with no argument to print the live 
      - GPU, compute, render, media, copy engine utilization (%)
    * - ``TEMPERATURE``
      - ``p``
-     - GPU core and memory temperatures. Shortcut ``p`` also enables POWER.
+     - GPU core, memory and composite temperatures, configured throttle/shutdown thresholds. Shortcut ``p`` also enables POWER.
    * - ``POWER``
      - ``p``
      - Card- and GPU-domain power draw, energy counters, power limits. Shortcut ``p`` also enables TEMPERATURE.
@@ -213,15 +246,21 @@ metric category. Run ``xpu-smi --query-gpu`` with no argument to print the live 
    * - ``PCI``
      - ``t``
      - PCIe link gen/width (max and current), TX/RX throughput, replay counter
-   * - ``ECC``
-     - ``e``
-     - ECC mode, corrected/uncorrected error counts, RAS error categories
    * - ``EU_ARRAY``
      - ``x``
      - EU active/stall/idle percentages (Intel Xe only)
    * - ``FAN``
      - ``f``
      - Fan speed (%)
+   * - ``COMPUTE``
+     - —
+     - Scheduler mode
+   * - ``PERFORMANCE``
+     - —
+     - Whether each clock throttle reason is active
+   * - ``SUPPORTED_CLOCKS``
+     - —
+     - GPU clocks the frequency range can be set to
    * - ``ALL``
      - —
      - All metrics from all groups
@@ -262,13 +301,25 @@ Multi-char combos expand character-by-character (e.g. ``pu`` = POWER + TEMPERATU
        driver declares no version
    * - ``vbios_version``
      - —
-     - VBIOS version string
+     - GFX firmware version (shown as GFX Firmware Version in the query report)
    * - ``pci.bus_id``
      - —
      - PCI BDF address
+   * - ``ip_version``
+     - —
+     - Graphics IP version, in hex; identifies the architecture and stepping
    * - ``pci.device_id``
      - —
      - PCI device ID
+   * - ``pci.base_class``
+     - —
+     - PCI base class code, in hex: ``0x03`` display controller, ``0x12`` processing accelerator
+   * - ``pci.sub_class``
+     - —
+     - PCI subclass code, in hex
+   * - ``recovery_action``
+     - —
+     - What the device needs to keep working: ``None``, ``Reset``, or ``Reset to repair``
    * - ``pci.sub_device_id``
      - —
      - PCI subsystem device ID (Linux only)
@@ -278,6 +329,27 @@ Multi-char combos expand character-by-character (e.g. ``pu`` = POWER + TEMPERATU
    * - ``temperature.memory``
      - C
      - Memory temperature
+   * - ``temperature.composite``
+     - C
+     - Composite temperature
+   * - ``temperature.gpu.threshold.throttle``
+     - C
+     - Configured GPU core temperature at which the clock is throttled
+   * - ``temperature.gpu.threshold.shutdown``
+     - C
+     - Configured GPU core temperature at which the device shuts down
+   * - ``temperature.gpu.max``
+     - C
+     - Highest temperature the driver says the GPU sensor can operate at
+   * - ``temperature.memory.max``
+     - C
+     - Highest temperature the driver says the memory sensor can operate at
+   * - ``temperature.memory.threshold.throttle``
+     - C
+     - Configured memory temperature at which the clock is throttled
+   * - ``temperature.memory.threshold.shutdown``
+     - C
+     - Configured memory temperature at which the device shuts down
    * - ``power.draw``
      - W
      - Card-domain power draw, averaged over the sampling interval
@@ -286,9 +358,28 @@ Multi-char combos expand character-by-character (e.g. ``pu`` = POWER + TEMPERATU
      - GPU-domain power draw, averaged over the sampling interval: compute engines only,
        excluding memory and other card subsystems. ``N/A`` on devices that expose no GPU
        power domain
+   * - ``power.draw.instant``
+     - W
+     - Card-domain power draw at this moment, as the driver reports it; needs a runtime and loader
+       that support it, and root on CRI
    * - ``power.limit``
      - W
      - Current power limit
+   * - ``power.limit.default``
+     - W
+     - Default power limit from device properties
+   * - ``power.limit.min``
+     - W
+     - Lowest power limit that can be set, from device properties
+   * - ``power.draw.memory.instant``
+     - W
+     - Memory-domain power draw at this moment, on devices with a memory power domain
+   * - ``power.limit.burst``
+     - W
+     - Burst power limit (PL2), on devices that report one
+   * - ``power.limit.peak``
+     - W
+     - Peak power limit (PL4), on devices that report one
    * - ``power.max_limit``
      - W
      - Maximum power limit
@@ -311,6 +402,13 @@ Multi-char combos expand character-by-character (e.g. ``pu`` = POWER + TEMPERATU
    * - ``utilization.media``
      - %
      - Media engine utilization
+   * - ``utilization.video``
+     - %
+     - Busiest video decode/encode engine; one engine class does both on Linux, so they are not
+       reported apart
+   * - ``utilization.video_enhancement``
+     - %
+     - Busiest video enhancement engine (scaling, color conversion)
    * - ``utilization.copy``
      - %
      - Copy engine utilization
@@ -320,6 +418,10 @@ Multi-char combos expand character-by-character (e.g. ``pu`` = POWER + TEMPERATU
    * - ``memory.total``
      - MiB
      - Total memory
+   * - ``memory.reserved``
+     - MiB
+     - Memory the driver keeps back: installed size minus ``memory.total``; included in
+       ``memory.used``
    * - ``memory.used``
      - MiB
      - Used memory
@@ -335,6 +437,15 @@ Multi-char combos expand character-by-character (e.g. ``pu`` = POWER + TEMPERATU
    * - ``memory.bandwidth.utilization``
      - %
      - Memory bandwidth utilization
+   * - ``clocks.throttle_time``
+     - us
+     - Time the GPU clock has been held back by any throttle reason; the Linux runtime does not count it
+   * - ``performance.factor.compute``
+     - —
+     - Performance factor (0-100) of the compute engines; 50 is balanced
+   * - ``performance.factor.media``
+     - —
+     - Performance factor (0-100) of the media engines; 50 is balanced
    * - ``clocks.current.graphics`` (alias: ``clocks.current.sm``)
      - MHz
      - Current graphics/SM clock
@@ -347,9 +458,23 @@ Multi-char combos expand character-by-character (e.g. ``pu`` = POWER + TEMPERATU
    * - ``clocks.max.media`` (alias: ``clocks.max.video``)
      - MHz
      - Max media clock
+   * - ``clocks.supported.graphics``
+     - MHz
+     - GPU core clocks the minimum and maximum of ``config --frequencyrange`` can be set
+       to: ``low-high step N`` when evenly spaced, otherwise a ``;`` separated list. The GPU
+       cannot be pinned to one of them, and there is no list for the memory clock, which
+       cannot be set
+   * - ``clocks.requested.graphics``
+     - MHz
+     - GPU core clock the driver last requested from the hardware
    * - ``clocks.throttle.reason``
      - —
      - Active clock throttle reason flags
+   * - ``clocks.event_reasons.<reason>``
+     - —
+     - Whether one throttle reason is active (``Active`` or ``Not Active``). One field per
+       reason: ``thermal_limit``, ``average_power_cap``, ``burst_power_cap``, ``current_limit``,
+       ``psu_alert``, ``sw_range``, ``hw_range``, ``voltage``, ``thermal_alert``, ``power_alert``
    * - ``pcie.link.gen.max``
      - —
      - Maximum PCIe generation
@@ -362,6 +487,39 @@ Multi-char combos expand character-by-character (e.g. ``pu`` = POWER + TEMPERATU
    * - ``pcie.link.width.current``
      - —
      - Current PCIe link width
+   * - ``pci.bar.memory.size``
+     - MiB
+     - Size of the device's largest memory BAR, the window through which the host reaches its local memory
+   * - ``pci.bar.resizable``
+     - —
+     - Resizable BAR on that BAR: ``Enabled`` or ``Disabled``; reading it needs ``CAP_SYS_ADMIN``
+   * - ``pcie.link.gen.host_max``
+     - —
+     - Maximum PCIe generation of the root port the device is under (Linux); a switch in between can limit the link further
+   * - ``pcie.link.width.host_max``
+     - —
+     - Maximum PCIe link width of the root port the device is under (Linux)
+   * - ``pcie.errors.correctable``
+     - —
+     - PCIe correctable errors since the device was enumerated (AER, Linux)
+   * - ``pcie.errors.non_fatal``
+     - —
+     - PCIe uncorrectable non-fatal errors since enumeration (AER, Linux)
+   * - ``pcie.errors.fatal``
+     - —
+     - PCIe uncorrectable fatal errors since enumeration (AER, Linux)
+   * - ``pcie.errors.replay_rollovers``
+     - —
+     - PCIe REPLAY_NUM rollovers since enumeration (AER, Linux)
+   * - ``pcie.errors.replay_timeouts``
+     - —
+     - PCIe replay timer timeouts since enumeration (AER, Linux)
+   * - ``pcie.atomic.completer``
+     - —
+     - PCIe AtomicOp requests the device completes, e.g. ``FETCHADD_32 SWAP_32 CAS_32``; needs root on Linux
+   * - ``pcie.atomic.requests``
+     - —
+     - Whether the device may send PCIe AtomicOp requests: ``Enabled`` or ``Disabled``; needs root on Linux
    * - ``pcie.tx.throughput``
      - MB/s
      - PCIe transmit throughput
@@ -377,42 +535,9 @@ Multi-char combos expand character-by-character (e.g. ``pu`` = POWER + TEMPERATU
    * - ``pcie.replay.counter``
      - —
      - PCIe replay error counter
-   * - ``ecc.mode.current``
+   * - ``vf.enabled``
      - —
-     - ECC mode (enabled/disabled)
-   * - ``ecc.errors.corrected.aggregate.total``
-     - —
-     - Total corrected ECC errors
-   * - ``ecc.errors.uncorrected.aggregate.total``
-     - —
-     - Total uncorrected ECC errors
-   * - ``ecc.errors.aggregate.total``
-     - —
-     - Total ECC errors (corrected + uncorrected)
-   * - ``ras.reset``
-     - —
-     - RAS reset error counter
-   * - ``ras.programming.errors``
-     - —
-     - RAS programming error counter
-   * - ``ras.driver.errors``
-     - —
-     - RAS driver error counter
-   * - ``ras.cache.errors.correctable``
-     - —
-     - RAS correctable cache error counter
-   * - ``ras.cache.errors.uncorrectable``
-     - —
-     - RAS uncorrectable cache error counter
-   * - ``ras.non_compute.errors.correctable``
-     - —
-     - RAS correctable non-compute error counter
-   * - ``ras.non_compute.errors.uncorrectable``
-     - —
-     - RAS uncorrectable non-compute error counter
-   * - ``ras.non_compute.errors.total``
-     - —
-     - RAS non-compute error counter (correctable + uncorrectable)
+     - SR-IOV virtual functions enabled on the physical function
    * - ``eu.active``
      - %
      - EU array active percentage (Intel Xe only)
@@ -425,8 +550,6 @@ Multi-char combos expand character-by-character (e.g. ``pu`` = POWER + TEMPERATU
    * - ``fan.speed``
      - %
      - Fan speed percentage
-
-The ``ecc.errors.*`` and ``ras.*`` error counters read the same RAS categories as ``stats -r``;
-the ``ecc.errors.*`` totals add up every hardware category, i.e. all but resets, programming and
-driver errors. A counter shows ``N/A`` when the device reports none of the categories it counts, as
-opposed to ``0``, which means no errors were counted.
+   * - ``scheduler.mode``
+     - —
+     - Scheduler mode: timeout, timeslice or exclusive

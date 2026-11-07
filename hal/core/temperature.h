@@ -81,6 +81,7 @@ public:
 	ze_result_t getProperties(zes_temp_handle_t temperatureHandle, zes_temp_properties_t *properties);
 	ze_result_t getState(zes_temp_handle_t temperatureHandle, double *temp);
 	ze_result_t getTemp(zes_temp_sensors_t type, double *temp);
+	[[nodiscard]] ze_result_t getMaxTemp(zes_temp_sensors_t type, double *maxTemp);
 	ze_result_t getTempPerTile(zes_temp_sensors_t type, std::map<uint32_t, double> &tileTemperatures);
 	ze_result_t getCoreTemp(double *coreTemp);
 	ze_result_t getMemoryTemp(double *memTemp);
@@ -94,6 +95,7 @@ public:
 	uint64_t getThrottleCoreTemperature(uint32_t pciDeviceId);
 	uint64_t getShutdownCoreTemperature(uint32_t pciDeviceId);
 	uint64_t getShutdownMemoryTemperature(uint32_t pciDeviceId);
+	[[nodiscard]] uint64_t cappedByDriverMax(uint64_t defaultValue, zes_temp_sensors_t type);
 
 	// Helper functions for JSON threshold loading
 	static uint32_t parseDeviceId(const std::string &hexKey);

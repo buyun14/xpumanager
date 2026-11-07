@@ -109,6 +109,8 @@ private:
 	// Cached result of the memory vendor ID extension support check (see isMemoryVendorSupported).
 	// -1 = not yet queried, 0 = unsupported, 1 = supported.
 	int memoryVendorSupported = -1;
+	// pNext stype of the vendor extension the driver advertises; set when memoryVendorSupported == 1.
+	uint32_t memoryVendorStype = 0;
 
 	// Returns true when the driver advertises the memory vendor ID extension. The result is cached
 	// so the driver extension list is only enumerated once per device.
@@ -127,6 +129,7 @@ public:
 	ze_result_t getState(zes_mem_handle_t memhandle, zes_mem_state_t *state);
 	ze_result_t getBandwidth(zes_mem_handle_t memhandle, zes_mem_bandwidth_t *bandwidth);
 	ze_result_t getMemorySize(uint64_t *size);
+	[[nodiscard]] ze_result_t getMemoryReserved(uint64_t *reserved);
 	ze_result_t getMemoryHealth(zes_mem_health_t *health);
 	ze_result_t getMemoryChannels(int32_t *channels);
 	ze_result_t getMemoryBusWidth(int32_t *busWidth);

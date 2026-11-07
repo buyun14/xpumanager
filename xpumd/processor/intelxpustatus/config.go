@@ -8,6 +8,7 @@ package intelxpustatus
 import (
 	"fmt"
 	"math"
+	"slices"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -47,16 +48,42 @@ type HealthRule struct {
 	ComponentFilters common.AttributeFilterList `mapstructure:"component_filters"`
 	// Filters to apply on the parent metric.
 	ParentFilters common.AttributeFilterList `mapstructure:"parent_filters"`
+	// Aggregate the (filtered) source data points before evaluating the
+	// states. If not set, each data point is evaluated separately.
+	Aggregate *AggregateRule `mapstructure:"aggregate"`
 	// Ordered list of state rules to evaluate. All rules are evaluated, and
 	// the last matching one will be active. Thus, the rules should be ordered
 	// by increasing severity.
 	States []StateRule `mapstructure:"states"`
 }
 
+// AggregateFunction is a function for aggregating data point values.
+type AggregateFunction string
+
+const (
+	AggregateFunctionSum AggregateFunction = "Sum"
+	AggregateFunctionMin AggregateFunction = "Min"
+	AggregateFunctionMax AggregateFunction = "Max"
+)
+
+// AggregateRule defines how source data points are aggregated.
+type AggregateRule struct {
+	// Function to apply to the data points.
+	Function AggregateFunction `mapstructure:"function"`
+	// Source metric attributes to group the data points by. Data points are
+	// also implicitly grouped by their parent (ParentRefAttribute). These
+	// attributes are implicitly copied to the StatusMetric, in addition to
+	// HealthRule.CopyAttributes.
+	GroupBy []string `mapstructure:"group_by"`
+}
+
 // StateRule defines when to apply a specific state.
 type StateRule struct {
-	// Conditions to evaluate to apply this state. A logical OR is applied i.e.
-	// the rule matches if any of the conditions match.
+	// Conditions to evaluate on whether to apply this state.
+	// If condition includes a matching [ConditionRule.ParentFilters] filter,
+	// no further conditions are considered.
+	// Missing filter matches always i.e. acts as a default.
+	// Conditions are evaluated in order, so default should be the last one.
 	Conditions []ConditionRule `mapstructure:"conditions"`
 	// Value to set to the state attribute (HealthRule.StateAttribute) of the
 	// generated metric (HealthRule.StatusMetric).
@@ -113,13 +140,62 @@ func (r *HealthRule) Validate() error {
 	if len(r.States) == 0 {
 		return fmt.Errorf("at least one state is required")
 	}
+	if r.ParentMetric == "" {
+		if len(r.ParentFilters) > 0 {
+			return fmt.Errorf("parent_filters requires parent_metric")
+		}
+		for _, state := range r.States {
+			for _, cond := range state.Conditions {
+				if len(cond.ParentFilters) > 0 {
+					return fmt.Errorf("condition parent_filters of state %q requires parent_metric", state.StateName)
+				}
+			}
+		}
+	}
 	return nil
+}
+
+// Validate checks if the configuration is valid.
+func (a *AggregateRule) Validate() error {
+	if slices.Contains(a.GroupBy, "") {
+		return fmt.Errorf("group_by attribute cannot be empty")
+	}
+	switch a.Function {
+	case AggregateFunctionSum, AggregateFunctionMin, AggregateFunctionMax:
+		return nil
+	case "":
+		return fmt.Errorf("aggregate function is required")
+	default:
+		return fmt.Errorf("invalid aggregate function %q", a.Function)
+	}
+}
+
+func (a *AggregateRule) apply(acc, value float64) float64 {
+	switch a.Function {
+	case AggregateFunctionSum:
+		return acc + value
+	case AggregateFunctionMin:
+		return math.Min(acc, value)
+	case AggregateFunctionMax:
+		return math.Max(acc, value)
+	default:
+		return math.NaN()
+	}
 }
 
 // Validate checks if the configuration is valid.
 func (t *StateRule) Validate() error {
 	if t.StateName == "" {
 		return fmt.Errorf("state_name cannot be empty")
+	}
+	hasDefault := false
+	for _, cond := range t.Conditions {
+		if hasDefault {
+			return fmt.Errorf("default condition not last one")
+		}
+		if len(cond.ParentFilters) == 0 {
+			hasDefault = true
+		}
 	}
 	return nil
 }
@@ -132,6 +208,10 @@ func (r *ConditionRule) Validate() error {
 	return nil
 }
 
-func (r *ConditionRule) match(value float64, parentAttrs pcommon.Map) bool {
-	return value >= r.Value && r.ParentFilters.Match(parentAttrs)
+func (r *ConditionRule) matchValue(value float64) bool {
+	return value >= r.Value
+}
+
+func (r *ConditionRule) matchParent(parentAttrs pcommon.Map) bool {
+	return r.ParentFilters.Match(parentAttrs)
 }

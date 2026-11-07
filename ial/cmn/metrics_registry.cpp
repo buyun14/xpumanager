@@ -13,14 +13,15 @@
 #include "metrics/fan.h"
 #include "metrics/memory.h"
 #include "metrics/power.h"
-#include "metrics/ecc.h"
 #include "metrics/identity.h"
 #include "metrics/clock.h"
+#include "metrics/mode.h"
 #include "device.h"
 #include "zes_api.h"
 #include "ze_api.h"
 #include <enginegroup.h>
 #include <functional>
+#include <future>
 #include <iterator>
 #include <memory.h>
 #include <metric.h>
@@ -40,6 +41,7 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+#include "utility/watchdog/watchdog.h"
 
 namespace {
 
@@ -68,6 +70,11 @@ static constexpr auto ENGINE_MAP = std::to_array<EngineEntry>({
 	{&EngineCache::render, ZES_ENGINE_GROUP_RENDER_ALL},
 	{&EngineCache::media, ZES_ENGINE_GROUP_MEDIA_ALL},
 	{&EngineCache::copy, ZES_ENGINE_GROUP_COPY_ALL},
+	// One video engine class does both decode and encode on Linux, so they share one figure.
+	{&EngineCache::video, ZES_ENGINE_GROUP_MEDIA_DECODE_SINGLE},
+	{&EngineCache::video, ZES_ENGINE_GROUP_MEDIA_ENCODE_SINGLE},
+	{&EngineCache::video, ZES_ENGINE_GROUP_MEDIA_CODEC_SINGLE},
+	{&EngineCache::videoEnhance, ZES_ENGINE_GROUP_MEDIA_ENHANCEMENT_SINGLE},
 });
 
 EngineCache deriveEngineUtil(const std::vector<EngineActivitySample> &before,
@@ -80,13 +87,50 @@ EngineCache deriveEngineUtil(const std::vector<EngineActivitySample> &before,
 	for (const auto &entry : ENGINE_MAP) {
 		const auto perTile = enginegroup::computeGroupUtilPerTile(before, after, entry.group);
 		if (const auto util = enginegroup::deviceUtilFromTiles(perTile)) {
-			engines.*entry.slot = {.percent = *util, .valid = true};
+			auto &slot = engines.*entry.slot;
+			// Several groups can feed one figure; it is the busiest of them.
+			slot = {.percent = slot.valid ? std::max(slot.percent, *util) : *util, .valid = true};
 		}
 	}
 	return engines;
 }
 
-MetricCache populateMetricCacheBegin(devInfo &dev, MetricInput inputs)
+/**
+ * @brief Reads EU active/stall/idle for one device.
+ *
+ * Opens an OA metric streamer and blocks for its fixed monitor window. Takes what it needs by
+ * value, so it can run on another thread for longer than the caller's devInfo lives.
+ *
+ * @retval sample  The first sub-device's figures.
+ * @retval nullopt The device has no metric support or the HAL call failed.
+ */
+[[nodiscard]] static std::optional<EuMetricsData> sampleEu(metric *m, ze_device_handle_t device,
+														   ze_driver_handle_t driver)
+{
+	if (m == nullptr || device == nullptr) {
+		return std::nullopt;
+	}
+	std::vector<EuMetricsData> euVec;
+	if (m->getEuActiveStallIdle(device, driver, euVec) != ZE_RESULT_SUCCESS || euVec.empty()) {
+		return std::nullopt;
+	}
+	return euVec[0];
+}
+
+// The device's fdinfo snapshots: from the shared snapshot when the caller took one, otherwise
+// from a walk of its own.
+static std::vector<fdinfo::ProcessSnapshot> fdinfoOf(const devInfo &dev, const fdinfo::DeviceSnapshots *fdinfoNow)
+{
+	const std::string pci = devPciAddr(dev);
+	return fdinfoNow != nullptr ? fdinfo::snapshotsFor(*fdinfoNow, pci) : fdinfo::capture(pci);
+}
+
+fdinfo::DeviceSnapshots captureFdinfo(MetricInput inputs)
+{
+	return hasInput(inputs, MetricInput::FDINFO) ? fdinfo::captureAll() : fdinfo::DeviceSnapshots{};
+}
+
+MetricCache populateMetricCacheBegin(devInfo &dev, MetricInput inputs, const fdinfo::DeviceSnapshots *fdinfoNow)
 {
 	MetricCache cache;
 	cache.inputs = inputs;
@@ -127,12 +171,17 @@ MetricCache populateMetricCacheBegin(devInfo &dev, MetricInput inputs)
 		mem->getMemoryRW(&cache.memBefore.read, &cache.memBefore.write, &cache.memMaxBandwidth, &cache.memBefore.ts);
 	}
 	if (hasInput(inputs, MetricInput::FDINFO)) {
-		cache.fdinfoSnap = fdinfo::capture(devPciAddr(dev));
+		cache.fdinfoSnap = fdinfoOf(dev, fdinfoNow);
+	}
+	if (hasInput(inputs, MetricInput::EU)) {
+		cache.euPending =
+			std::async(std::launch::async, sampleEu, dev.dev->getMetric(), dev.deviceHdl, dev.dev->getDriverHandle())
+				.share();
 	}
 	return cache;
 }
 
-void populateMetricCacheEnd(devInfo &dev, MetricCache &cache)
+void populateMetricCacheEnd(devInfo &dev, MetricCache &cache, const fdinfo::DeviceSnapshots *fdinfoNow)
 {
 	const MetricInput inputs = cache.inputs;
 	enginegroup *eg = dev.dev->getEngineGroup();
@@ -169,7 +218,9 @@ void populateMetricCacheEnd(devInfo &dev, MetricCache &cache)
 			// Reset replay count so a stale value is never visible alongside pcieAvail=false.
 			cache.pcieReplay = 0;
 		}
-		cache.pcieAvail = cache.pcieAvail && pcieEndOk && (cache.pcieAfter.timeUs > cache.pcieBefore.timeUs);
+		// An idle link may leave the timestamp where it was; the getters read that as zero
+		// throughput. Only a timestamp that went backwards makes the window unusable.
+		cache.pcieAvail = cache.pcieAvail && pcieEndOk && (cache.pcieAfter.timeUs >= cache.pcieBefore.timeUs);
 	} else {
 		cache.pcieAvail = false;
 		cache.pcieReplay = 0;
@@ -199,28 +250,31 @@ void populateMetricCacheEnd(devInfo &dev, MetricCache &cache)
 	cache.euAvail = false;
 	cache.euSample = {};
 	if (hasInput(inputs, MetricInput::EU)) {
-		metric *m = dev.dev->getMetric();
-		if (m != nullptr && dev.deviceHdl != nullptr) {
-			std::vector<EuMetricsData> euVec;
-			if (m->getEuActiveStallIdle(dev.deviceHdl, dev.dev->getDriverHandle(), euVec) == ZE_RESULT_SUCCESS &&
-				!euVec.empty()) {
-				cache.euSample = euVec[0];
-				cache.euAvail = true;
-			}
+		const auto eu = cache.euPending.valid()
+							? cache.euPending.get()
+							: sampleEu(dev.dev->getMetric(), dev.deviceHdl, dev.dev->getDriverHandle());
+		if (eu) {
+			cache.euSample = *eu;
+			cache.euAvail = true;
 		}
 	}
+	cache.euPending = {};
 
 	cache.fdinfoCompute = std::nullopt;
 	cache.fdinfoRender = std::nullopt;
 	cache.fdinfoMedia = std::nullopt;
+	cache.fdinfoVideo = std::nullopt;
+	cache.fdinfoVideoEnhance = std::nullopt;
 	cache.fdinfoCopy = std::nullopt;
 	if (hasInput(inputs, MetricInput::FDINFO)) {
-		auto fdAfter = fdinfo::capture(devPciAddr(dev));
+		auto fdAfter = fdinfoOf(dev, fdinfoNow);
 		const auto devUtil = fdinfo::aggregateDeviceUtil(cache.fdinfoSnap, fdAfter);
 		cache.fdinfoSnap = std::move(fdAfter);
 		cache.fdinfoCompute = devUtil.compute;
 		cache.fdinfoRender = devUtil.render;
 		cache.fdinfoMedia = devUtil.media;
+		cache.fdinfoVideo = devUtil.video;
+		cache.fdinfoVideoEnhance = devUtil.videoEnhance;
 		cache.fdinfoCopy = devUtil.copy;
 	}
 	cache.populated = true;
@@ -231,7 +285,7 @@ MetricCache populateMetricCache(devInfo &dev, std::chrono::milliseconds window, 
 	const auto deadline = std::chrono::steady_clock::now() + window;
 	MetricCache cache = populateMetricCacheBegin(dev, inputs);
 	if (inputs != MetricInput::NONE) {
-		std::this_thread::sleep_until(deadline);
+		xpum::watchdog::sleepUntil(deadline);
 	}
 	populateMetricCacheEnd(dev, cache);
 	return cache;
@@ -255,11 +309,13 @@ std::optional<float> busiestEngineClass(std::optional<float> compute, std::optio
 	return busiest;
 }
 
-MetricCache populateMetricCacheContinuous(devInfo &dev, const MetricCache &prev, MetricInput inputs)
+MetricCache populateMetricCacheContinuous(devInfo &dev, const MetricCache &prev, MetricInput inputs,
+										  const fdinfo::DeviceSnapshots *fdinfoNow)
 {
 	MetricCache curr;
 	curr.inputs = inputs;
 	curr.serialNumber = prev.serialNumber;
+	curr.serialRetryAt = prev.serialRetryAt;
 
 	// Promote prev's after-snapshots into curr's before-slots (no sleep needed).
 	// The engine figures are derived rather than carried over: what a new window needs is the
@@ -283,7 +339,7 @@ MetricCache populateMetricCacheContinuous(devInfo &dev, const MetricCache &prev,
 	// can compute per-tick deltas; EU metrics are re-sampled fresh each tick.
 	curr.fdinfoSnap = prev.fdinfoSnap;
 
-	populateMetricCacheEnd(dev, curr);
+	populateMetricCacheEnd(dev, curr, fdinfoNow);
 	return curr;
 }
 
@@ -291,7 +347,9 @@ MetricCache populateMetricCacheContinuous(devInfo &dev, const MetricCache &prev,
 //
 //  Registry API implementations
 
-// Each metrics/X.h owns one group and exposes getXMetrics() returning a span.
+// Each metrics/X.h owns one group and exposes getXMetrics() returning a span. The ECC group
+// (metrics/ecc.h) is left out until its RAS reads are reliable: a RAS call the driver never
+// answers stalls every command that samples it.
 
 std::span<const QueryMetric> getQueryMetrics() noexcept
 {
@@ -304,12 +362,12 @@ std::span<const QueryMetric> getQueryMetrics() noexcept
 		const auto fan = fan::getFanMetrics();
 		const auto memory = memory::getMemoryMetrics();
 		const auto power = power::getPowerMetrics();
-		const auto ecc = ecc::getEccMetrics();
 		const auto clock = clock::getClockMetrics();
+		const auto mode = mode::getModeMetrics();
 
 		std::vector<QueryMetric> metricVec;
 		for (const std::span<const QueryMetric> s :
-			 {identity, temperature, utilization, pci, euArray, fan, memory, power, ecc, clock}) {
+			 {identity, temperature, utilization, pci, euArray, fan, memory, power, clock, mode}) {
 			metricVec.insert(metricVec.end(), s.begin(), s.end());
 		}
 		return metricVec;

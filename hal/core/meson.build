@@ -4,6 +4,7 @@
 # HAL core (Hardware Abstraction Layer Core) build
 
 hal_core_sources = files(
+  'bounded_call.cpp',
   'debug.cpp',
   'device.cpp',
   'driver.cpp',
@@ -69,7 +70,7 @@ libxpum_shared = shared_library(
     include_directories('../../ial/cli'),
   ]
   + extensions_inc_dirs,
-  dependencies: [levelzero_dep, igsc_dep, oal_dep, fwupd_dep, nlohmann_json_dep, compat_dep, units_dep]
+  dependencies: [levelzero_dep, igsc_dep, oal_dep, fwupd_dep, nlohmann_json_dep, compat_dep, units_dep, circuit_breaker_dep]
   + windows_deps,
   version: xpum_version,
   soversion: xpum_version.split('.')[0],
@@ -91,7 +92,7 @@ libxpum_static = static_library(
     include_directories('../../ial/cli'),
   ]
   + extensions_inc_dirs,
-  dependencies: [levelzero_dep, igsc_dep, oal_dep, fwupd_dep, amc_dep, nlohmann_json_dep, compat_dep, units_dep]
+  dependencies: [levelzero_dep, igsc_dep, oal_dep, fwupd_dep, amc_dep, nlohmann_json_dep, compat_dep, units_dep, circuit_breaker_dep]
   + windows_deps,
   install: get_option('static_library'),
   install_dir: get_option('libdir'),
@@ -139,6 +140,31 @@ if get_option('with_tests')
     install: false,
   )
   test('temperature_tests', temperature_test)
+
+  bounded_call_test = executable(
+    'bounded_call_test',
+    files('test/bounded_call_test.cpp'),
+    include_directories: [global_inc, hal_core_inc, oal_inc_dirs],
+    link_with: libxpum_static,
+    dependencies: [doctest_dep, levelzero_dep, igsc_dep, nlohmann_json_dep, circuit_breaker_dep],
+    link_args: is_linux ? ['-pie'] : [],
+    build_by_default: true,
+    install: false,
+  )
+  test('bounded_call_tests', bounded_call_test)
+
+  # Defines the RAS entry points itself, so it runs without a GPU.
+  ras_test = executable(
+    'ras_test',
+    files('test/ras_test.cpp'),
+    include_directories: [global_inc, hal_core_inc, oal_inc_dirs],
+    link_with: libxpum_static,
+    dependencies: [doctest_dep, levelzero_dep, igsc_dep, nlohmann_json_dep, circuit_breaker_dep],
+    link_args: is_linux ? ['-pie'] : [],
+    build_by_default: true,
+    install: false,
+  )
+  test('ras_tests', ras_test)
   message('Temperature unit tests enabled')
 
   memory_test = executable(
@@ -188,12 +214,51 @@ if get_option('with_tests')
         '-Wl,--wrap=igsc_device_close',
         '-Wl,--wrap=igsc_device_iterator_create',
         '-Wl,--wrap=igsc_device_iterator_destroy',
+        '-Wl,--wrap=igsc_image_fwdata_init',
+        '-Wl,--wrap=igsc_image_fwdata_version2',
+        '-Wl,--wrap=igsc_image_fwdata_release',
+        '-Wl,--wrap=igsc_device_fwdata_version2',
+        '-Wl,--wrap=zesFirmwareGetProperties',
+        '-Wl,--wrap=zesFirmwareFlash',
+        '-Wl,--wrap=zesFirmwareGetFlashProgress',
       ],
       build_by_default: true,
       install: false,
     )
     test('gscupd_tests', gscupd_test)
     message('GSC firmware update unit tests enabled')
+
+    firmware_test = executable(
+      'firmware_test',
+      files('test/firmware_test.cpp'),
+      include_directories: [
+        global_inc,
+        hal_core_inc,
+        oal_inc_dirs,
+        include_directories('../fwupd'),
+        include_directories('../amc'),
+      ],
+      link_with: libxpum_static,
+      dependencies: [doctest_dep, levelzero_dep, igsc_dep, nlohmann_json_dep],
+      link_args: [
+        '-pie',
+        '-Wl,--wrap=zesDeviceEnumFirmwares',
+        '-Wl,--wrap=zesFirmwareGetProperties',
+        '-Wl,--wrap=zesFirmwareFlash',
+        '-Wl,--wrap=zesDevicePciGetProperties',
+        '-Wl,--wrap=igsc_device_iterator_create',
+        '-Wl,--wrap=igsc_device_iterator_next',
+        '-Wl,--wrap=igsc_device_iterator_destroy',
+        '-Wl,--wrap=igsc_device_init_by_device',
+        '-Wl,--wrap=igsc_device_fw_version',
+        '-Wl,--wrap=igsc_get_last_firmware_status',
+        '-Wl,--wrap=igsc_device_close',
+      ],
+      build_by_default: true,
+      install: false,
+    )
+    test('firmware_tests', firmware_test)
+    message('Firmware unit tests enabled')
 
     process_test = executable(
       'process_test',

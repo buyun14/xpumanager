@@ -13,11 +13,12 @@
 #include "os.h"
 #include <CLI/CLI.hpp>
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmd_smi.h>
+#include <frame_loop.h>
 #include <cmd_dump.h>
 #include <metrics_registry.h>
+#include <version_report.h>
 #include <array>
 #include <charconv>
 #include <exception>
@@ -26,12 +27,11 @@
 #include <optional>
 #include <memory>
 #include <ranges>
-#include <csignal>
 #include "terminal.h"
+#include "utility/watchdog/watchdog.h"
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
 #include <vector>
 
 // ---- Implementation helpers -----------------------------------------------
@@ -52,6 +52,7 @@ struct PreArgs
 	std::string countStr;
 	std::string logFilePath;
 	bool loopInMs = false;
+	bool showAll = false; // --all: keep idle runtime contexts in the default view's process table
 };
 
 // Declarative flag specification for pre-extraction.
@@ -113,7 +114,7 @@ bool tryExtractFlag(const FlagSpec &spec, std::string_view a, int &i, int argc, 
 // Pre-extraction is needed for:
 //   - --loop-ms: multi-char short flag that CLI11 rejects
 //   - --query-gpu: optional-value flag (bare --query-gpu + -d POWER is valid)
-//   - top-level flags that share names with subcommand flags (--id, --display, etc.)
+//   - top-level flags that share names with subcommand flags (--id, --display, --all, etc.)
 //
 // Only long-form options are supported in v2.0 (short aliases removed except -f).
 std::pair<PreArgs, std::vector<std::string>> extractPreArgs(arg_struct *args)
@@ -180,6 +181,11 @@ std::pair<PreArgs, std::vector<std::string>> extractPreArgs(arg_struct *args)
 			}
 			continue;
 		}
+		// After a subcommand name, --all belongs to that subcommand (ps --all).
+		if (a == "--all" && std::ranges::none_of(argvVec, [](const std::string &s) { return !s.starts_with('-'); })) {
+			pre.showAll = true;
+			continue;
+		}
 		if (std::ranges::any_of(flagSpecs, [&](const FlagSpec &spec) {
 				if (!tryExtractFlag(spec, a, i, args->argc, args->argv)) {
 					return false;
@@ -209,6 +215,29 @@ void configureFileLogging(const std::string &logFilePath)
 	} catch (const std::exception &) {
 		PRINT("Warning: Failed to open log file '{}'", logFilePath);
 	}
+}
+
+/**
+ * @brief Describe a failure to parse the top-level options by the argument actually at fault.
+ *
+ * An unexpected argument keeps the "was not expected" wording and names the first one CLI11
+ * rejected. When @p rejected starts with the "--" that ended the options, which CLI11 accepts,
+ * the argument after that "--" is named. Any other failure, such as --format without its value,
+ * gets CLI11's own text, which names the option.
+ *
+ * @param [in] error    What CLI::App::parse() threw.
+ * @param [in] rejected The arguments CLI11 did not consume (CLI::App::remaining()), in command-line order,
+ *                      including a "--" that ended the options.
+ * @return The diagnostic, without a trailing newline.
+ */
+[[nodiscard]] std::string describeParseError(const CLI::ParseError &error, const std::vector<std::string> &rejected)
+{
+	if (dynamic_cast<const CLI::ExtrasError *>(&error) == nullptr || rejected.empty()) {
+		return error.what();
+	}
+	// A leading "--" is the one that ended the options, which CLI11 accepts; what it rejected comes next.
+	const std::string &first = (rejected.size() > 1 && rejected.front() == "--") ? rejected[1] : rejected.front();
+	return xpum::compat::format("The following argument was not expected: '{}'.", first);
 }
 
 // Build a QueryFormat from pre-extracted arguments and the --format string.
@@ -244,91 +273,43 @@ QueryFormat buildQueryFormat(const PreArgs &pre, const std::string &formatStr)
 	return fmt;
 }
 
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<bool> gSmiQuit{false};
-
 /**
  * @brief Run cmdSmi once or repeatedly at a fixed interval.
  *
  * When @p loopMs is zero, runs cmdSmi exactly once and returns its result
  * (@p count is ignored in single-shot mode).
- * When @p loopMs is positive, renders frames repeatedly, sleeping @p loopMs
- * milliseconds between frames, until SIGINT or SIGTERM is received or
+ * When @p loopMs is positive, renders frames through runFrameLoop(), sleeping
+ * @p loopMs milliseconds between frames, until a stop event arrives or
  * @p count frames have been produced.  With @p tty true, uses an alternate
  * screen buffer so each frame overwrites the previous cleanly; with @p tty
  * false, frames are appended without ANSI sequences.  The alternate screen is
- * always restored before returning, including on error and on SIGTERM.
+ * always restored before returning, including on error and on a stop event.
  *
  * @param args   CLI arguments forwarded to cmdSmi.
  * @param loopMs Interval between frames in milliseconds; 0 = single-shot.
  * @param count  Maximum frames to produce; 0 = unlimited.  Ignored when
  *               @p loopMs is zero.
  * @param tty    True when stdout is an interactive terminal with ANSI support.
+ * @param showAll  Keep idle runtime contexts in the process table (--all).
  *
  * @retval 0                          Success.
  * @retval ZE_RESULT_ERROR_DEVICE_LOST No GPU devices found.
  * @retval ZE_RESULT_ERROR_*          Propagated from cmdSmi.
  */
-int runSmiWithLoop(arg_struct *args, int loopMs, int count, bool tty = true)
+int runSmiWithLoop(arg_struct *args, int loopMs, int count, bool tty = true, bool showAll = false)
 {
 	cmdSmi smi;
+	smi.showAll = showAll;
 	if (loopMs <= 0) {
 		return smi.run(args);
 	}
 
-	constexpr int pollSliceMs = 100;
-	gSmiQuit.store(false, std::memory_order_relaxed);
-	const auto sigHandler = [](int) { gSmiQuit.store(true, std::memory_order_relaxed); };
-	UNUSED auto prevSigint = std::signal(SIGINT, sigHandler);
-	UNUSED auto prevSigterm = std::signal(SIGTERM, sigHandler);
-
-	if (tty) {
-		PRINT("\033[?1049h"); // enter alternate screen buffer
-	}
-
-	int iterations = 0;
-	ze_result_t loopResult = ZE_RESULT_SUCCESS;
-	while (!gSmiQuit.load(std::memory_order_relaxed) && (count <= 0 || iterations < count)) {
-		// Start the deadline before collection so the interval accounts for the
-		// 200 ms sampling window inside collectAndRender.
-		const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(loopMs);
-		auto [result, output] = smi.collectAndRender(args);
-		if (result != ZE_RESULT_SUCCESS) {
-			loopResult = result;
-			break;
-		}
-		if (tty) {
-			PRINT("\033[H\033[J"); // cursor home + erase to end — clear stale rows
-		}
-		PRINT("{}", output.c_str());
-		++iterations;
-		if (count > 0 && iterations >= count) {
-			break;
-		}
-
-		// Sleep in pollSliceMs chunks so SIGINT/SIGTERM is noticed promptly.
-		while (!gSmiQuit.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < deadline) {
-			const auto remaining =
-				std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
-			std::this_thread::sleep_for(std::min(remaining, std::chrono::milliseconds(pollSliceMs)));
-		}
-	}
-
-	if (tty) {
-		PRINT("\033[?1049l"); // restore normal screen buffer before any diagnostic output
-	}
-	std::signal(SIGINT, prevSigint);
-	std::signal(SIGTERM, prevSigterm);
-
-	if (loopResult != ZE_RESULT_SUCCESS) {
-		if (loopResult == ZE_RESULT_ERROR_DEVICE_LOST) {
-			PRINT("No GPU devices found.\n");
-		} else {
-			PRINT("Device error: 0x{:X}\n", static_cast<uint32_t>(loopResult));
-		}
-		return loopResult;
-	}
-	return 0;
+	return runFrameLoop(
+		[&smi, args] {
+			auto [status, text] = smi.collectAndRender(args);
+			return RenderedFrame{status, std::move(text)};
+		},
+		{.interval = std::chrono::milliseconds{loopMs}, .count = count, .tty = tty});
 }
 
 } // namespace
@@ -367,8 +348,13 @@ void DefaultParser::printExtraOptions()
 	PRINT("  --loop[=<sec>]              Repeat query every <sec> seconds (default: 1)\n");
 	PRINT("  --loop-ms=<ms>              Repeat query every <ms> milliseconds\n");
 	PRINT("  --count=<n>                 Number of loop iterations (default: infinite)\n");
+	PRINT("  --all                       Also list idle runtime contexts a multi-GPU process holds on\n");
+	PRINT("                              GPUs it is not using (default view only)\n");
 	PRINT("  --format=csv[,noheader][,nounits]  Output format for --query-gpu\n");
 	PRINT("  -f,--file=<path>            Log output to file instead of stdout\n");
+	PRINT("  -v,--version                Build provenance and runtime versions\n");
+	PRINT("  --timeout=<sec>             Abort with exit code 124 after <sec> seconds without progress\n");
+	PRINT("                              (default: 30, 0 = off; any command, any position)\n");
 }
 
 std::optional<int> DefaultParser::handleTopLevel(arg_struct *args, const std::vector<std::unique_ptr<cmds>> &cmdList)
@@ -394,16 +380,7 @@ std::optional<int> DefaultParser::handleTopLevel(arg_struct *args, const std::ve
 		return std::nullopt; // subcommand name — fall through to dispatch
 	}
 
-	/* Top-level flags (-h/--help, -v/--version, -q/--query/--query-gpu).
-	 *
-	 * Note: -q/--query is handled before CLI11 to avoid CLI11 prefix-matching
-	 * '--query' against '--query-gpu' (since '--query' is a prefix of '--query-gpu'). */
-	const std::string_view flag{args->argv[1]};
-	if (flag == "-q" || flag == "--query") {
-		PRINT("query: not yet implemented.\n");
-		return 0;
-	}
-
+	// Top-level flags (-h/--help, -v/--version, --list-gpus, --query-gpu, ...).
 	CLI::App topApp{"", std::string{DefaultParser::progName()}};
 	topApp.set_help_flag("-h,--help", "Print this help message and exit");
 
@@ -412,11 +389,18 @@ std::optional<int> DefaultParser::handleTopLevel(arg_struct *args, const std::ve
 	std::string formatStr;
 	topApp.add_flag("-v,--version", versionFlag, "Display version information and exit");
 	topApp.add_flag("--list-gpus", listGpusFlag, "Print a list of GPUs and exit");
-	topApp.add_option("--format", formatStr, "Output format: csv[,noheader][,nounits]");
+	// An empty value ("--format ''") is as missing as in "--format=", so it fails with the same message.
+	topApp.add_option("--format", formatStr, "Output format: csv[,noheader][,nounits]")
+		->check([](const std::string &value) {
+			return value.empty() ? std::string{"1 required TEXT missing"} : std::string{};
+		});
 
 	auto [pre, argvVec] = extractPreArgs(args);
 	configureFileLogging(pre.logFilePath);
 
+	// CLI11 consumes this vector from the back, so hand it over reversed. In typed order,
+	// "--format csv" reaches "csv" before "--format" and fails to parse (XPUM-1626).
+	std::ranges::reverse(argvVec);
 	try {
 		topApp.parse(argvVec);
 	} catch (const CLI::CallForHelp &) {
@@ -426,7 +410,7 @@ std::optional<int> DefaultParser::handleTopLevel(arg_struct *args, const std::ve
 			printFullHelp(*this, cmdList);
 		}
 		return 0;
-	} catch (const CLI::ParseError &) {
+	} catch (const CLI::ParseError &e) {
 		// If argvVec is not empty, it contains unparsed tokens for a subcommand.
 		if (!argvVec.empty()) {
 			// Rebuild args->argv/argc so subcommand dispatch sees the stripped tokens.
@@ -446,17 +430,22 @@ std::optional<int> DefaultParser::handleTopLevel(arg_struct *args, const std::ve
 			args->argc = static_cast<int>(ownedArgv_.argv.size());
 			return std::nullopt;
 		}
-		PRINT("The following argument was not expected: '{}'.\n", args->argv[1]);
+		PRINT("{}\n", describeParseError(e, topApp.remaining()));
 		printFullHelp(*this, cmdList);
 		return 1;
 	}
 
 	if (versionFlag) {
-		// The loader reports no component versions until zesInit has run.
-		if (auto rc = requireDriver(args, DriverMode::SysmanOnly); rc.has_value()) {
-			return rc;
+		// Host half first: it needs no driver, so it still prints if sysman init fails
+		// or crashes, which is exactly when -v is most likely to be run.
+		VersionReport report = collectHostVersionReport();
+		PRINT("{}", formatHostVersionReport(report));
+		// The loader reports no component versions until zesInit has run. A failed
+		// init shortens the report rather than failing it.
+		if (!requireDriver(args, DriverMode::SysmanOnly).has_value()) {
+			addDriverVersionInfo(report, args->sm);
 		}
-		printVersion(args);
+		PRINT("{}", formatDriverVersionReport(report));
 		return 0;
 	}
 	if (listGpusFlag) {
@@ -487,20 +476,21 @@ std::optional<int> DefaultParser::handleTopLevel(arg_struct *args, const std::ve
 		return cmdDump::runQuery(effectiveQuery, pre.deviceSpec, args, buildQueryFormat(pre, formatStr), selector);
 	}
 
+	// Checked before the remaining tokens: a trailing "--" ends the options, but CLI11 hands it
+	// back, so "xpu-smi --format=csv --" would otherwise go on to subcommand dispatch.
+	if (!formatStr.empty()) {
+		ERR("--format is not supported without a subcommand; did you mean 'xpu-smi dump --format {}'?\n", formatStr);
+		return 1;
+	}
 	// If no subcommand tokens remain, run the default smi view (possibly looped).
 	// Otherwise fall through to subcommand dispatch (e.g., xpu-smi -f file.txt dump help).
 	if (argvVec.empty()) {
-		if (!formatStr.empty()) {
-			PRINT("error: --format is not supported without a subcommand; did you mean 'xpu-smi dump --format {}'?\n",
-				  formatStr);
-			return 1;
-		}
 		if (auto rc = requireDriver(args, DriverMode::Full); rc.has_value()) {
 			return rc;
 		}
 		const auto fmt = buildQueryFormat(pre, formatStr);
 		const int loopMs = (fmt.count > 0 && fmt.loopMs <= 0) ? 1000 : fmt.loopMs;
-		return runSmiWithLoop(args, loopMs, fmt.count, stdoutIsTerminal() && pre.logFilePath.empty());
+		return runSmiWithLoop(args, loopMs, fmt.count, stdoutIsTerminal() && pre.logFilePath.empty(), pre.showAll);
 	}
 	return std::nullopt;
 }

@@ -17,14 +17,18 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <future>
 #include <metric.h>
 #include <optional>
+#include <ras.h>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <type_traits>
 #include <vector>
+#include "utility/watchdog/watchdog.h"
 
 namespace metrics {
 
@@ -82,17 +86,20 @@ template <BitmaskEnum Enum> [[nodiscard]] constexpr bool hasFlag(Enum field, Enu
 enum class MetricGroup : uint32_t
 {
 	NONE = 0,
-	IDENTITY = 1U << 0,	   /**< name, index, uuid, serial, driver_version, kernel_driver_version,
-								vbios_version + PCI IDs */
-	MEMORY = 1U << 1,	   /**< memory.total/used/free, utilization.memory */
-	UTILIZATION = 1U << 2, /**< utilization.gpu/compute/render/media/copy */
-	TEMPERATURE = 1U << 3, /**< temperature.gpu/memory */
-	POWER = 1U << 4,	   /**< power.draw, energy.consumed */
-	CLOCK = 1U << 5,	   /**< clocks.current.graphics/memory */
-	PCI = 1U << 6,		   /**< pci.*, pcie.link.*, pcie.tx/rx.throughput, pcie.replay */
-	ECC = 1U << 7,		   /**< ecc.mode.current, ecc.errors.corrected/uncorrected; analogous to dmon -s e */
-	EU_ARRAY = 1U << 8,	   /**< eu.active/stall/idle (Intel Xe-only) */
-	FAN = 1U << 9,		   /**< fan.speed */
+	IDENTITY = 1U << 0,			 /**< name, index, uuid, serial, driver_version, kernel_driver_version,
+									  vbios_version + PCI IDs */
+	MEMORY = 1U << 1,			 /**< memory.total/used/free, utilization.memory */
+	UTILIZATION = 1U << 2,		 /**< utilization.gpu/compute/render/media/copy */
+	TEMPERATURE = 1U << 3,		 /**< temperature.gpu/memory */
+	POWER = 1U << 4,			 /**< power.draw, energy.consumed */
+	CLOCK = 1U << 5,			 /**< clocks.current.graphics/memory */
+	PCI = 1U << 6,				 /**< pci.*, pcie.link.*, pcie.tx/rx.throughput, pcie.replay */
+	ECC = 1U << 7,				 /**< ecc.mode.current, ecc.errors.corrected/uncorrected; not in the registry */
+	EU_ARRAY = 1U << 8,			 /**< eu.active/stall/idle (Intel Xe-only) */
+	FAN = 1U << 9,				 /**< fan.speed */
+	PERFORMANCE = 1U << 10,		 /**< clocks.event_reasons.*: why the GPU clock is held back */
+	SUPPORTED_CLOCKS = 1U << 11, /**< clocks.supported.*: clocks the frequency range can be set to */
+	COMPUTE = 1U << 12,			 /**< scheduler.*: how the device schedules compute work */
 	ALL = ~0U,
 };
 
@@ -194,15 +201,41 @@ struct EngineCache
 	 * (XPUM-1483).
 	 */
 	UtilSample gpu{};
-	UtilSample compute{}; /**< ZES_ENGINE_GROUP_COMPUTE_ALL, as the driver aggregates it */
-	UtilSample render{};  /**< ZES_ENGINE_GROUP_RENDER_ALL */
-	UtilSample media{};	  /**< ZES_ENGINE_GROUP_MEDIA_ALL */
-	UtilSample copy{};	  /**< ZES_ENGINE_GROUP_COPY_ALL */
+	UtilSample compute{};	   /**< ZES_ENGINE_GROUP_COMPUTE_ALL, as the driver aggregates it */
+	UtilSample render{};	   /**< ZES_ENGINE_GROUP_RENDER_ALL */
+	UtilSample media{};		   /**< ZES_ENGINE_GROUP_MEDIA_ALL */
+	UtilSample copy{};		   /**< ZES_ENGINE_GROUP_COPY_ALL */
+	UtilSample video{};		   /**< The busiest single decode, encode or codec engine */
+	UtilSample videoEnhance{}; /**< The busiest single video enhancement engine */
+};
+
+/** One read of a device's experimental RAS states, shared by every ECC field of a sample. */
+struct RasRead
+{
+	ze_result_t status{};
+	std::map<zes_ras_error_type_t, std::vector<ras_state_exp_t>> states;
+};
+
+/** One read of a device's frequency throttle reasons, shared by every throttle field of a sample. */
+struct ThrottleRead
+{
+	ze_result_t status{};
+	zes_freq_throttle_reason_flags_t flags{};
 };
 
 struct MetricCache
 {
 	mutable std::optional<std::string> serialNumber;
+	/** When a cached "unknown" serial number is queried again; it can be transient, e.g. while
+	 *  another process holds the AMC. */
+	mutable std::chrono::steady_clock::time_point serialRetryAt{};
+	/**
+	 * The RAS states, read on first use. Each ECC field sums a different part of them, and a
+	 * read is slow on some runtimes and serialized across devices, so it is done once per sample.
+	 */
+	mutable std::optional<RasRead> rasRead;
+	/** The throttle reasons, read on first use; every throttle field tests the same flags. */
+	mutable std::optional<ThrottleRead> throttleRead;
 	/**
 	 * Which raw sampling this cache was built with; see @ref MetricInput. Set once by
 	 * @ref populateMetricCacheBegin (or @ref populateMetricCacheContinuous) and read back by
@@ -230,6 +263,12 @@ struct MetricCache
 	bool powerAvail = false; /**< true when power HAL is present */
 	/** EU active/stall/idle — populated once per tick by populateMetricCacheEnd */
 	EuMetricsData euSample{};
+	/**
+	 * EU sample that @ref populateMetricCacheBegin started, so that its fixed monitor window
+	 * runs alongside the sampling window instead of after it. Collected and cleared by
+	 * @ref populateMetricCacheEnd, which samples synchronously when there is none.
+	 */
+	std::shared_future<std::optional<EuMetricsData>> euPending;
 	bool euAvail = false; /**< true when getEuActiveStallIdle succeeded */
 	bool populated = false;
 	std::vector<fdinfo::ProcessSnapshot>
@@ -237,6 +276,8 @@ struct MetricCache
 	std::optional<float> fdinfoCompute; ///< device-level compute util from fdinfo (available without root)
 	std::optional<float> fdinfoRender;
 	std::optional<float> fdinfoMedia;
+	std::optional<float> fdinfoVideo;		 ///< decode/encode engines from fdinfo
+	std::optional<float> fdinfoVideoEnhance; ///< video enhancement engines from fdinfo
 	std::optional<float> fdinfoCopy;
 };
 
@@ -284,10 +325,14 @@ struct MetricCache
  * @param inputs  Which raw sampling to perform; see @ref MetricInput. Stamped onto the returned
  *               cache's @ref MetricCache::inputs, so the paired @ref populateMetricCacheEnd
  *               call always samples the same set — it cannot be passed a different one.
+ * @param fdinfoNow  Snapshot of every device taken now with @ref captureFdinfo, shared by all the
+ *               devices of one sample so /proc is walked once rather than once per device;
+ *               @c nullptr makes this call take its own.
  * @return       A partially-populated MetricCache containing only before-samples.
  *               @c populated is @c false until @ref populateMetricCacheEnd is called.
  */
-[[nodiscard]] MetricCache populateMetricCacheBegin(devInfo &dev, MetricInput inputs = MetricInput::ALL);
+[[nodiscard]] MetricCache populateMetricCacheBegin(devInfo &dev, MetricInput inputs = MetricInput::ALL,
+												   const fdinfo::DeviceSnapshots *fdinfoNow = nullptr);
 
 /**
  * Take the "after" half of a delta sample and mark the cache as ready.
@@ -301,12 +346,13 @@ struct MetricCache
  *               is no separate @c inputs parameter here to fall out of sync with it.
  *               On return, all after-sample fields are written and
  *               @c cache.populated is set to @c true.
+ * @param fdinfoNow  As for @ref populateMetricCacheBegin, taken at the end of the window.
  * @note         All availability flags are recomputed from scratch on each call. Flags for
  *               sampling @c cache.inputs excludes stay @c false, so those metrics render @c N/A.
  *               @c powerAvail requires both @c populateMetricCacheBegin and this call
  *               to have produced valid, advancing timestamps.
  */
-void populateMetricCacheEnd(devInfo &dev, MetricCache &cache);
+void populateMetricCacheEnd(devInfo &dev, MetricCache &cache, const fdinfo::DeviceSnapshots *fdinfoNow = nullptr);
 
 /**
  * Persistent-delta variant for continuous / dmon-loop mode.
@@ -320,13 +366,28 @@ void populateMetricCacheEnd(devInfo &dev, MetricCache &cache);
  *              cache the same way @ref populateMetricCacheBegin does, so should match the value
  *              used to build @p prev — otherwise the promoted before-slots this tick asks
  *              @ref populateMetricCacheEnd for were never actually sampled last tick.
+ * @param fdinfoNow  As for @ref populateMetricCacheBegin.
  * @return      A fully-populated MetricCache representing the interval
  *              [prev's after-sample timestamp, now].
  * @pre         @p prev must have been produced by a prior call that set
  *              @c prev.populated == true.
  */
 [[nodiscard]] MetricCache populateMetricCacheContinuous(devInfo &dev, const MetricCache &prev,
-														MetricInput inputs = MetricInput::ALL);
+														MetricInput inputs = MetricInput::ALL,
+														const fdinfo::DeviceSnapshots *fdinfoNow = nullptr);
+
+/**
+ * @brief One fdinfo snapshot of every device, for a sample that covers several devices
+ *
+ * Each fdinfo snapshot reads every process's open fds, so devices sampled together share one
+ * per time point: pass it as @c fdinfoNow to @ref populateMetricCacheBegin,
+ * @ref populateMetricCacheEnd and @ref populateMetricCacheContinuous.
+ *
+ * @param[in] inputs  What the sample reads; see @ref inputsOf.
+ * @retval snapshots  @p inputs includes @c MetricInput::FDINFO
+ * @retval empty      it does not, so /proc is not walked
+ */
+[[nodiscard]] fdinfo::DeviceSnapshots captureFdinfo(MetricInput inputs);
 
 // ── MetricValue ───────────────────────────────────────────────────────────────
 
@@ -356,6 +417,12 @@ struct QueryMetric
 	 * header text alone size the column, which truncates such values with an ellipsis.
 	 */
 	int minWidth = 0;
+	/**
+	 * The getter asks the device firmware directly, over the GSC or the AMC, which can take
+	 * hundreds of milliseconds. Such a getter reads no window data, does not change while the
+	 * device runs, and is safe to run on its own thread alongside the device's other getters.
+	 */
+	bool readsFirmware = false;
 	ze_result_t (*getter)(devInfo &d, MetricValue &out, const MetricCache &cache);
 };
 
@@ -411,9 +478,11 @@ inline constexpr auto GROUP_TABLE = std::to_array<MetricGroupEntry>({
 	{"POWER", "p", MetricGroup::POWER},				/**< "p" shared with TEMPERATURE */
 	{"CLOCK", "c", MetricGroup::CLOCK},
 	{"PCI", "t", MetricGroup::PCI},
-	{"ECC", "e", MetricGroup::ECC},
 	{"EU_ARRAY", "x", MetricGroup::EU_ARRAY},
 	{"FAN", "f", MetricGroup::FAN},
+	{"COMPUTE", "", MetricGroup::COMPUTE},
+	{"PERFORMANCE", "", MetricGroup::PERFORMANCE},
+	{"SUPPORTED_CLOCKS", "", MetricGroup::SUPPORTED_CLOCKS},
 	{"ALL", "", MetricGroup::ALL},
 });
 
@@ -432,7 +501,7 @@ inline constexpr auto GROUP_TABLE = std::to_array<MetricGroupEntry>({
  *
  * @note The shortcut @c "p" matches both @c POWER and @c TEMPERATURE in one token.
  *
- * @param sv  Comma-separated token list, e.g. @c "MEMORY,u" or @c "power, ECC".
+ * @param sv  Comma-separated token list, e.g. @c "MEMORY,u" or @c "power, FAN".
  * @return    Bitmask of all matched MetricGroup values, or @c MetricGroup::NONE if
  *            no token matched.
  */
@@ -684,12 +753,14 @@ void runMetrics(Output &output, std::span<const QueryMetric *> fields, std::span
 	std::vector<MetricCache> caches(devices.size());
 	if (inputs != MetricInput::NONE) {
 		const auto deadline = std::chrono::steady_clock::now() + detail::SAMPLE_WINDOW;
+		const fdinfo::DeviceSnapshots fdBefore = captureFdinfo(inputs);
 		for (std::size_t i = 0; i < devices.size(); ++i) {
-			caches[i] = populateMetricCacheBegin(devices[i], inputs);
+			caches[i] = populateMetricCacheBegin(devices[i], inputs, &fdBefore);
 		}
-		std::this_thread::sleep_until(deadline);
+		xpum::watchdog::sleepUntil(deadline);
+		const fdinfo::DeviceSnapshots fdAfter = captureFdinfo(inputs);
 		for (std::size_t i = 0; i < devices.size(); ++i) {
-			populateMetricCacheEnd(devices[i], caches[i]);
+			populateMetricCacheEnd(devices[i], caches[i], &fdAfter);
 		}
 	}
 

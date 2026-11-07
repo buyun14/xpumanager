@@ -20,17 +20,30 @@ ARG BASE_IMAGE=scratch
 #      FILES_DIR=debs/<package-dir>
 ARG BACKEND=deb
 
+# NOTE: The base images are pinned by digest for reproducible builds (Dependabot updates them).
+
+# --- Go toolchain (self-contained, so it can be copied to the builder image) ---
+FROM golang:1.27.3-trixie@sha256:c65ecfe613b539ac74c62a4c3b2c27e8f8a6076384c8f27e8a3c0f3be17cc385 AS go
+
 # --- Base build stage with necessary distro setup / packages ---
-FROM golang:1.27-trixie AS builder-base
+#
+# NOTE: The final image gets its runtime libraries (libc, libstdc++, libudev...) from here,
+# match distro with what the driver stack packages are built for.
+# (buildpack-deps is Ubuntu with common build tools: compilers, make, git, curl...)
+FROM buildpack-deps:24.04@sha256:19a04a89ed67f2c52c255e17bdd6d6962b7eb3aaae4d62da6b1b8797142bca90 AS builder-base
+
+COPY --from=go /usr/local/go/ /usr/local/go/
+ENV GOPATH=/go \
+    GOTOOLCHAIN=local \
+    PATH=/go/bin:/usr/local/go/bin:$PATH
 
 # Enable source packages, install IGSC build dependencies and extra Sysman dependencies
 # (Sysman does not link the latter but loads them at runtime: netlink for RAS and
 # fabric metrics, tracefs for info logs)
-RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources && \
+RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources && \
     apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     libcyaml-dev \
-    libyaml-dev \
     ninja-build \
     libudev-dev \
     pkg-config \
@@ -136,7 +149,7 @@ Architecture: amd64\n\
 Version: ${METEE_VERSION}\n\
 Homepage: https://github.com/intel/metee\n\
 Description: Intel(R) ME TEE Library (statically linked to libigsc)\n\
-\n" >> /out/var/lib/dpkg/status
+" >> /out/var/lib/dpkg/status
 
 
 # --- Alias for source build builder stage ---
@@ -202,6 +215,7 @@ RUN if [ -n "$TOOLS" ]; then \
 # Build xpumd / xpuinfo-cli + stub driver & install them
 # Use '--build-arg BUILD_TARGET=build-cover' to get coverage-instrumented binaries
 ARG BUILD_TARGET=build
+ARG XPUMD_VERSION=latest
 RUN --mount=type=cache,target=/go/pkg/mod/ \
     --mount=type=cache,target=/root/.cache/go-build \
     --mount=src=.,target=.,rw \
@@ -354,7 +368,7 @@ Version: ${VERSION}+git.${COMPUTE_RUNTIME_COMMIT}\n\
 Homepage: https://github.com/intel/compute-runtime\n\
 Description: Intel(R) Graphics Compute Runtime for oneAPI Level Zero\n\
  Built from the pinned compute-runtime revision, not from the released package.\n\
-\n" > /backend/var/lib/dpkg/status
+" > /backend/var/lib/dpkg/status
 
 
 # --- The backend selected with BACKEND ---

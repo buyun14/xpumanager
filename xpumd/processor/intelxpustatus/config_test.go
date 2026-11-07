@@ -89,9 +89,94 @@ func TestConfigValidate(t *testing.T) {
 				Name:          "gpu-health",
 				SourceMetric:  "hw.temperature",
 				States:        []StateRule{{StateName: "warning", Conditions: []ConditionRule{{Value: 85}}}},
-				ParentFilters: common.AttributeFilterList{{Key: "hw.type", Values: []string{""}}},
+				ParentMetric:  "hw.gpu.info",
+				ParentFilters: common.AttributeFilterList{{Key: "hw.type"}},
 			},
-			expectErr: `filter value cannot be empty for key "hw.type"`,
+			expectErr: `filter values are required for key "hw.type"`,
+		},
+		{
+			name: "valid parent filters",
+			rule: HealthRule{
+				Name:          "gpu-health",
+				SourceMetric:  "hw.temperature",
+				ParentMetric:  "hw.gpu.info",
+				ParentFilters: common.AttributeFilterList{{Key: "hw.vendor", Values: []string{"Intel"}}},
+				States: []StateRule{{StateName: "warning", Conditions: []ConditionRule{
+					{Value: 95, ParentFilters: common.AttributeFilterList{{Key: "pci.device_id", Values: []string{"56c0"}}}},
+					{Value: 85},
+				}}},
+			},
+		},
+		{
+			name: "parent filters without parent metric",
+			rule: HealthRule{
+				Name:          "gpu-health",
+				SourceMetric:  "hw.temperature",
+				States:        []StateRule{{StateName: "warning", Conditions: []ConditionRule{{Value: 85}}}},
+				ParentFilters: common.AttributeFilterList{{Key: "hw.vendor", Values: []string{"Intel"}}},
+			},
+			expectErr: "parent_filters requires parent_metric",
+		},
+		{
+			name: "condition parent filters without parent metric",
+			rule: HealthRule{
+				Name:         "gpu-health",
+				SourceMetric: "hw.temperature",
+				States: []StateRule{{StateName: "warning", Conditions: []ConditionRule{
+					{Value: 95, ParentFilters: common.AttributeFilterList{{Key: "pci.device_id", Values: []string{"56c0"}}}},
+					{Value: 85},
+				}}},
+			},
+			expectErr: `condition parent_filters of state "warning" requires parent_metric`,
+		},
+		{
+			name: "valid aggregate",
+			rule: HealthRule{
+				Name:         "gpu-health",
+				SourceMetric: "hw.power",
+				States:       []StateRule{{StateName: "warning", Conditions: []ConditionRule{{Value: 85}}}},
+				Aggregate:    &AggregateRule{Function: AggregateFunctionSum, GroupBy: []string{"hw.id"}},
+			},
+		},
+		{
+			name: "missing aggregate function",
+			rule: HealthRule{
+				Name:         "gpu-health",
+				SourceMetric: "hw.power",
+				States:       []StateRule{{StateName: "warning", Conditions: []ConditionRule{{Value: 85}}}},
+				Aggregate:    &AggregateRule{GroupBy: []string{"hw.id"}},
+			},
+			expectErr: "aggregate function is required",
+		},
+		{
+			name: "invalid aggregate function",
+			rule: HealthRule{
+				Name:         "gpu-health",
+				SourceMetric: "hw.power",
+				States:       []StateRule{{StateName: "warning", Conditions: []ConditionRule{{Value: 85}}}},
+				Aggregate:    &AggregateRule{Function: "Avg"},
+			},
+			expectErr: `invalid aggregate function "Avg"`,
+		},
+		{
+			name: "empty group_by attribute",
+			rule: HealthRule{
+				Name:         "gpu-health",
+				SourceMetric: "hw.power",
+				States:       []StateRule{{StateName: "warning", Conditions: []ConditionRule{{Value: 85}}}},
+				Aggregate:    &AggregateRule{Function: AggregateFunctionSum, GroupBy: []string{"hw.id", ""}},
+			},
+			expectErr: "group_by attribute cannot be empty",
+		},
+		{
+			name: "2 defaults - default not last condition",
+			rule: HealthRule{
+				Name:         "gpu-health",
+				SourceMetric: "hw.power",
+				States:       []StateRule{{StateName: "warning", Conditions: []ConditionRule{{Value: 85}, {Value: 95}}}},
+				Aggregate:    &AggregateRule{Function: AggregateFunctionSum, GroupBy: []string{"hw.id", ""}},
+			},
+			expectErr: "default condition not last one",
 		},
 	}
 
@@ -254,7 +339,7 @@ func TestConditionRule(t *testing.T) {
 			for k, v := range tt.parentAttrs {
 				parentAttrs.PutStr(k, v)
 			}
-			got := tt.rule.match(tt.value, parentAttrs)
+			got := tt.rule.matchValue(tt.value) && tt.rule.matchParent(parentAttrs)
 			if got != tt.expectMatch {
 				t.Errorf("ConditionRule.match() = %v, want %v", got, tt.expectMatch)
 			}

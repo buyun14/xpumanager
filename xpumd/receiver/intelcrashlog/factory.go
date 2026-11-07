@@ -16,6 +16,12 @@ import (
 	"github.com/intel/xpumanager/xpumd/receiver/intelcrashlog/internal/metadata"
 )
 
+// defaultMaxFileSize is the default maximum size of a crashlog file (1 MiB).
+const defaultMaxFileSize = 1024 * 1024
+
+// defaultMinFileSize is the default minimum size of a crashlog file (skip empty files).
+const defaultMinFileSize = 1
+
 // NewFactory creates a factory for the receiver.
 func NewFactory() receiver.Factory {
 	return receiver.NewFactory(
@@ -29,6 +35,8 @@ func createDefaultConfig() component.Config {
 	return &Config{
 		Directory:       "",
 		IgnoreOlderThan: 0,
+		MaxFileSize:     defaultMaxFileSize,
+		MinFileSize:     defaultMinFileSize,
 	}
 }
 
@@ -37,5 +45,5 @@ func createLogsReceiver(_ context.Context, settings receiver.Settings, cfg compo
 	if !ok {
 		return nil, fmt.Errorf("invalid config type: %T", cfg)
 	}
-	return newReceiver(settings, c, nextConsumer), nil
+	return newReceiver(settings, c, nextConsumer)
 }

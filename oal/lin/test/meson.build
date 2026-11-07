@@ -45,6 +45,19 @@ if get_option('with_tests')
   )
 
   test('path_lookup_test', path_lookup_test)
+
+  # Terminal size tests, against a pseudo-terminal. Compiles terminal.cpp directly so the
+  # test needs no OAL link.
+  terminal_test = executable(
+    'terminal_test',
+    ['terminal_test.cpp', '../terminal.cpp', '../watchdog_os.cpp'],
+    include_directories: [global_inc, include_directories('..'), include_directories('../..')],
+    dependencies: [doctest_dep, thread_dep],
+    link_args: is_linux ? ['-pie'] : [],
+    build_by_default: true,
+  )
+
+  test('terminal_test', terminal_test)
   pci_switch_test = executable(
     'pci_switch_test',
     'pci_switch_test.cpp',
@@ -70,12 +83,12 @@ if get_option('with_tests')
 
   test('kernel_driver_test', kernel_driver_test)
 
-  # PCI subsystem device ID reads against a fake sysfs tree. Compiles
+  # PCI subsystem device ID and class code reads against a fake sysfs tree. Compiles
   # pci_sysfs.cpp directly so the test needs no OAL link.
   pci_sysfs_test = executable(
     'pci_sysfs_test',
     ['pci_sysfs_test.cpp', '../pci_sysfs.cpp'],
-    include_directories: [global_inc, include_directories('..')],
+    include_directories: [global_inc, include_directories('..'), include_directories('../..')],
     dependencies: [doctest_dep, bdf_dep],
     link_args: is_linux ? ['-pie'] : [],
     build_by_default: true,
@@ -122,6 +135,46 @@ if get_option('with_tests')
   )
 
   test('process_platform_test', process_platform_test)
+
+  # Per-device firmware update lock. Needs root; reports itself skipped otherwise.
+  # Compiles fs_lock.cpp directly so the test needs no OAL link.
+  fs_lock_test = executable(
+    'fs_lock_test',
+    ['fs_lock_test.cpp', '../fs_lock.cpp'],
+    include_directories: [global_inc, include_directories('..'), include_directories('../..')],
+    dependencies: [doctest_dep, bdf_dep, compat_dep],
+    link_args: is_linux ? ['-pie'] : [],
+    build_by_default: true,
+  )
+
+  test('fs_lock_test', fs_lock_test)
+
+  # Watchdog OS actions (raw writes, thread report) and the alternate-screen guard. Compiles
+  # the sources directly so the test needs no OAL link.
+  watchdog_os_test = executable(
+    'watchdog_os_test',
+    ['watchdog_os_test.cpp', '../watchdog_os.cpp', '../terminal.cpp'],
+    include_directories: [global_inc, include_directories('..'), include_directories('../..')],
+    dependencies: [doctest_dep, thread_dep],
+    link_args: is_linux ? ['-pie'] : [],
+    build_by_default: true,
+  )
+
+  test('watchdog_os_test', watchdog_os_test)
+
+  # Board serial number cache tests against a scratch cache directory and fake
+  # boot ID and sysfs files. Compiles serial_cache.cpp directly so the test needs
+  # no OAL link.
+  serial_cache_test = executable(
+    'serial_cache_test',
+    ['serial_cache_test.cpp', '../serial_cache.cpp'],
+    include_directories: [global_inc, include_directories('..'), include_directories('../..')],
+    dependencies: [doctest_dep, bdf_dep, compat_dep],
+    link_args: is_linux ? ['-pie'] : [],
+    build_by_default: true,
+  )
+
+  test('serial_cache_test', serial_cache_test)
 
   message('Unit tests enabled for OAL diagnostics')
 else

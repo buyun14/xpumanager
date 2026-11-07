@@ -847,8 +847,11 @@ func TestDeviceEnumDiagnosticTestSuites(t *testing.T) {
 
 func TestDeviceFabricPortGetMultiPortThroughput(t *testing.T) {
 	fabricPortGetMultiPortThroughput := func(d *Device) ([]FabricPortThroughput, error) {
-		// Pass nil (count=0) to avoid the CGo restriction on Go pointer slices.
-		return d.FabricPortGetMultiPortThroughput(nil)
+		ports, err := d.EnumFabricPorts()
+		if err != nil {
+			return nil, err
+		}
+		return d.FabricPortGetMultiPortThroughput(ports)
 	}
 
 	testDeviceGetterError(t,
@@ -857,7 +860,15 @@ func TestDeviceFabricPortGetMultiPortThroughput(t *testing.T) {
 	)
 	testDeviceGetterSuccess(t,
 		fabricPortGetMultiPortThroughput,
+		th.CheckValue([]FabricPortThroughput{
+			{Timestamp: 777777, RxCounter: 111111, TxCounter: 222222},
+			{},
+		}),
+	)
+	testDeviceGetterSuccess(t,
+		func(d *Device) ([]FabricPortThroughput, error) { return d.FabricPortGetMultiPortThroughput(nil) },
 		func(t *testing.T, results []FabricPortThroughput) { require.Empty(t, results) },
+		th.WithName("NoPorts"),
 	)
 }
 
@@ -1774,12 +1785,11 @@ func TestDiagnosticsGetTests(t *testing.T) {
 }
 
 func TestDiagnosticsRunTests(t *testing.T) {
-	testComponentGetterError(t, getDiagnostic, func(d *Diagnostics) ([]DiagResult, error) { return d.RunTests(0, 0) }, th.WithConfig(driverConfigComponentErrs))
-	testComponentGetterSuccess(t, getDiagnostic,
-		func(d *Diagnostics) ([]DiagResult, error) { return d.RunTests(0, 0) },
-		func(t *testing.T, results []DiagResult) {
-			require.Len(t, results, 1)
-			assert.Equal(t, DIAG_RESULT_NO_ERRORS, results[0], "results[0]")
-		},
-	)
+	runAll := func(d *Diagnostics) (DiagResult, error) {
+		return d.RunTests(DIAG_FIRST_TEST_INDEX, DIAG_FIRST_TEST_INDEX+9)
+	}
+	testComponentGetterError(t, getDiagnostic, runAll, th.WithConfig(driverConfigComponentErrs))
+	testComponentGetterSuccess(t, getDiagnostic, runAll, th.CheckValue(DIAG_RESULT_NO_ERRORS))
+	testComponentGetterSuccess(t, getDiagnostic, runAll, th.CheckValue(DIAG_RESULT_REBOOT_FOR_REPAIR),
+		th.WithCompIdx(1), th.WithName("SuccessRebootForRepair"))
 }

@@ -1,16 +1,18 @@
-# Attribute filter with an empty value in parent_filters (deep nesting)
+# Attribute filter with an invalid operator in parent_filters (deep nesting)
 #
-# expect-error: filter value cannot be empty for key "pci.device_id"
+# expect-error: invalid filter operator "Exists" for key "pci.device_id"
 
 processors:
   intel_xpu_status:
     rules:
       - name: "invalid condition parent filter"
         source_metric: "hw.temperature"
+        parent_metric: "hw.gpu.info"
         states:
           - state_name: "warning"
             conditions:
               - value: 95.0
                 parent_filters:
                   - key: "pci.device_id"
-                    values: [""]
+                    operator: "Exists"
+                    values: ["56c0"]

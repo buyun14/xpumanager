@@ -143,6 +143,36 @@ ze_result_t getBestLimitW(devInfo &d, MetricValue &out)
 }
 
 /**
+ * @brief Reads the power limit of one level, for the devices that report it.
+ *
+ * @tparam LEVEL The limit level, e.g. ZES_POWER_LEVEL_BURST.
+ *
+ * @param[in]  d   Device to query.
+ * @param[out] out Set to the limit in watts, @c "%.2f". Unchanged on failure.
+ *
+ * @retval ZE_RESULT_SUCCESS                   A nonzero limit of @p LEVEL was found.
+ * @retval ZE_RESULT_ERROR_UNSUPPORTED_FEATURE No power HAL, or no nonzero limit of @p LEVEL.
+ */
+template <zes_power_level_t LEVEL> ze_result_t levelLimitW(devInfo &d, MetricValue &out, const MetricCache &)
+{
+	auto *pw = d.dev->getPower();
+	if (pw == nullptr) {
+		return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+	}
+	std::vector<PowerLimitExt> limits;
+	if (pw->getLimitsExt(limits) != ZE_RESULT_SUCCESS) {
+		return ZE_RESULT_ERROR_NOT_AVAILABLE;
+	}
+	const auto it =
+		std::ranges::find_if(limits, [](const PowerLimitExt &l) { return l.level == LEVEL && l.limitMw != 0; });
+	if (it == limits.end()) {
+		return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+	}
+	out = xpum::compat::format("{:.2f}", static_cast<double>(it->limitMw) / 1000.0);
+	return ZE_RESULT_SUCCESS;
+}
+
+/**
  * @brief Queries the device for the maximum configurable power limit.
  *
  * Iterates over all power domain handles returned by the power HAL and returns the
@@ -170,7 +200,16 @@ ze_result_t getBestLimitW(devInfo &d, MetricValue &out)
  *       because the HAL implementation dereferences it unconditionally
  *       (memset + pNext assignment).
  */
-ze_result_t getMaxLimitW(devInfo &d, MetricValue &out)
+/**
+ * @brief Reads one limit from the device-level power domain properties.
+ *
+ * @tparam LIMIT zes_power_properties_t::maxLimit, ::defaultLimit or ::minLimit.
+ *
+ * @retval ZE_RESULT_SUCCESS                   @p out holds the limit in watts.
+ * @retval ZE_RESULT_ERROR_NOT_AVAILABLE       Device-level domains exist but report no value.
+ * @retval ZE_RESULT_ERROR_UNSUPPORTED_FEATURE No power HAL, or no device-level power domain.
+ */
+template <int32_t zes_power_properties_t::*LIMIT> ze_result_t propertyLimitW(devInfo &d, MetricValue &out)
 {
 	auto *pw = d.dev->getPower();
 	if (pw == nullptr) {
@@ -181,18 +220,28 @@ ze_result_t getMaxLimitW(devInfo &d, MetricValue &out)
 	if (handles == nullptr) {
 		return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
 	}
+	bool deviceLevel = false;
 	for (uint32_t i = 0; i < count; ++i) {
 		zes_power_properties_t props{};
 		zes_power_ext_properties_t extProps{};
 		props.stype = ZES_STRUCTURE_TYPE_POWER_PROPERTIES;
 		extProps.stype = ZES_STRUCTURE_TYPE_POWER_EXT_PROPERTIES;
-		if (pw->getProperties(handles[i], &props, &extProps) == ZE_RESULT_SUCCESS && (props.onSubdevice == 0U) &&
-			props.maxLimit > 0) {
-			out = xpum::compat::format("{:.2f}", static_cast<double>(props.maxLimit) / 1000.0);
+		if (pw->getProperties(handles[i], &props, &extProps) != ZE_RESULT_SUCCESS || props.onSubdevice != 0U) {
+			continue;
+		}
+		deviceLevel = true;
+		if (props.*LIMIT > 0) {
+			out = xpum::compat::format("{:.2f}", static_cast<double>(props.*LIMIT) / 1000.0);
 			return ZE_RESULT_SUCCESS;
 		}
 	}
-	return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+	// A device-level domain that reports -1 (or 0) does not know the limit; without one there is none.
+	return deviceLevel ? ZE_RESULT_ERROR_NOT_AVAILABLE : ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+}
+
+ze_result_t getMaxLimitW(devInfo &d, MetricValue &out)
+{
+	return propertyLimitW<&zes_power_properties_t::maxLimit>(d, out);
 }
 
 constexpr auto CARD_DRAW =
@@ -273,6 +322,27 @@ constexpr auto ENERGY_CONSUMED_GPU = QueryMetric{
 		return energyJoules(cache.gpuPowerAfter, out);
 	}};
 
+constexpr auto INSTANT_DRAW = QueryMetric{
+	// NOLINT(readability-identifier-naming)
+	.name = "power.draw.instant",
+	.unit = "W",
+	.description = "Card-domain power draw at this moment, as the driver reports it (zesPowerGetUsage). Needs a "
+				   "runtime and loader that support it; on CRI it comes from telemetry, which needs root",
+	.source = MetricSource::Live,
+	.groups = MetricGroup::POWER,
+	.getter = [](devInfo &d, MetricValue &out, const MetricCache &) -> ze_result_t {
+		auto *pw = d.dev->getPower();
+		if (pw == nullptr) {
+			return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+		}
+		uint32_t milliwatts = 0;
+		const auto r = pw->getInstantPower(&milliwatts, false);
+		if (r == ZE_RESULT_SUCCESS) {
+			out = xpum::compat::format("{:.2f}", static_cast<double>(milliwatts) / 1000.0);
+		}
+		return r;
+	}};
+
 // ── Power limit metrics ──────────────────────────────────────────────────────
 // power.limit     = current enforced power limit (sustained, with fallback to best available)
 // power.max_limit = maximum configurable power limit from device properties
@@ -301,8 +371,66 @@ constexpr auto MAX_LIMIT = QueryMetric{
 	.groups = MetricGroup::POWER,
 	.getter = [](devInfo &d, MetricValue &out, const MetricCache &) -> ze_result_t { return getMaxLimitW(d, out); }};
 
+constexpr auto DEFAULT_LIMIT =
+	QueryMetric{// NOLINT(readability-identifier-naming)
+				.name = "power.limit.default",
+				.unit = "W",
+				.description = "Default power limit from device properties (the card's rated power)",
+				.source = MetricSource::Static,
+				.groups = MetricGroup::POWER,
+				.getter = [](devInfo &d, MetricValue &out, const MetricCache &) -> ze_result_t {
+					return propertyLimitW<&zes_power_properties_t::defaultLimit>(d, out);
+				}};
+
+constexpr auto MIN_LIMIT = QueryMetric{// NOLINT(readability-identifier-naming)
+									   .name = "power.limit.min",
+									   .unit = "W",
+									   .description = "Lowest power limit that can be set, from device properties",
+									   .source = MetricSource::Static,
+									   .groups = MetricGroup::POWER,
+									   .getter = [](devInfo &d, MetricValue &out, const MetricCache &) -> ze_result_t {
+										   return propertyLimitW<&zes_power_properties_t::minLimit>(d, out);
+									   }};
+
+constexpr auto MEMORY_INSTANT_DRAW =
+	QueryMetric{// NOLINT(readability-identifier-naming)
+				.name = "power.draw.memory.instant",
+				.unit = "W",
+				.description = "Memory-domain power draw at this moment, on devices with a memory power domain",
+				.source = MetricSource::Live,
+				.groups = MetricGroup::POWER,
+				.getter = [](devInfo &d, MetricValue &out, const MetricCache &) -> ze_result_t {
+					auto *pw = d.dev->getPower();
+					if (pw == nullptr) {
+						return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+					}
+					uint32_t milliwatts = 0;
+					const auto r = pw->getMemoryInstantPower(&milliwatts);
+					if (r == ZE_RESULT_SUCCESS) {
+						out = xpum::compat::format("{:.2f}", static_cast<double>(milliwatts) / 1000.0);
+					}
+					return r;
+				}};
+
+constexpr auto BURST_LIMIT = QueryMetric{// NOLINT(readability-identifier-naming)
+										 .name = "power.limit.burst",
+										 .unit = "W",
+										 .description = "Burst power limit (PL2), on devices that report one",
+										 .source = MetricSource::Static,
+										 .groups = MetricGroup::POWER,
+										 .getter = levelLimitW<ZES_POWER_LEVEL_BURST>};
+
+constexpr auto PEAK_LIMIT = QueryMetric{// NOLINT(readability-identifier-naming)
+										.name = "power.limit.peak",
+										.unit = "W",
+										.description = "Peak power limit (PL4), on devices that report one",
+										.source = MetricSource::Static,
+										.groups = MetricGroup::POWER,
+										.getter = levelLimitW<ZES_POWER_LEVEL_PEAK>};
+
 constexpr auto ALL =
-	std::to_array<QueryMetric>({CARD_DRAW, CARD_DRAW_GPU, ENERGY_CONSUMED, ENERGY_CONSUMED_GPU, LIMIT, MAX_LIMIT});
+	std::to_array<QueryMetric>({CARD_DRAW, CARD_DRAW_GPU, INSTANT_DRAW, ENERGY_CONSUMED, ENERGY_CONSUMED_GPU, LIMIT,
+								BURST_LIMIT, PEAK_LIMIT, MAX_LIMIT, DEFAULT_LIMIT, MIN_LIMIT, MEMORY_INSTANT_DRAW});
 
 } // namespace
 
@@ -314,7 +442,10 @@ constexpr auto ALL =
  * - @c power.draw.gpu       (Live)   — GPU-domain instantaneous draw in watts
  * - @c energy.consumed      (Live)   — cumulative card-domain energy in joules
  * - @c energy.consumed.gpu  (Live)   — cumulative GPU-domain energy in joules
+ * - @c power.draw.instant   (Live)   — card-domain draw at this moment in watts
  * - @c power.limit          (Static) — current enforced power limit in watts
+ * - @c power.limit.burst    (Static) — burst power limit in watts
+ * - @c power.limit.peak     (Static) — peak power limit in watts
  * - @c power.max_limit      (Static) — maximum configurable power limit in watts
  *
  * @return A non-owning @c std::span over the internal @c ALL array. The span is valid

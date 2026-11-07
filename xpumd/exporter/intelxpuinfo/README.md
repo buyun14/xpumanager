@@ -3,7 +3,7 @@
 ## Overview
 
 The Intel XPU Info Exporter translates metrics and logs into device information
-that is exposed via a [`gRPC API`](api/deviceinfo/v1alpha1/).
+that is exposed via a [`gRPC API`](api/deviceinfo/v1alpha2/).
 
 ### Metrics pipeline
 
@@ -77,7 +77,8 @@ ones and a possible catch-all (empty `filters`) last.
 In addition to `endpoint`, the exporter supports a wide range of gRPC
 configuration options not listed above. See the OTel collector
 [gRPC configuration settings](https://github.com/open-telemetry/opentelemetry-collector/blob/main/config/configgrpc/README.md)
-documentation for details.
+documentation for details. The `auth` and `middlewares` settings are not
+supported.
 
 #### HwStatusMapping
 
@@ -93,7 +94,8 @@ documentation for details.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `key` | string | Attribute key to filter on |
-| `values` | []string | Attribute values to match (logical OR) |
+| `operator` | string | `In` (default): attribute exists and its value is one of `values`. `NotIn`: attribute is missing or its value is none of `values` |
+| `values` | []string | Attribute values to match against. At least one is required |
 
 #### HwStateMapping
 
@@ -105,7 +107,7 @@ documentation for details.
 
 ## gRPC API
 
-See [`api/deviceinfo/v1alpha1/`](api/deviceinfo/v1alpha1/) for the API definitions.
+See [`api/deviceinfo/v1alpha2/`](api/deviceinfo/v1alpha2/) for the API definitions.
 
 There's a small command-line client [`xpuinfo-cli/`](xpuinfo-cli/) for verifying
 the exporter output during development and testing.

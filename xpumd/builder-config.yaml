@@ -1,0 +1,43 @@
+dist:
+  module: github.com/intel/xpumanager/xpumd
+  name: xpumd
+  description: XPUM Daemon
+  output_path: ./dist
+  otelcol_version: 0.162.0
+  version: 0.0.0
+  # Enable CGO explicitly, as we are linking against external library
+  # Ref: https://github.com/open-telemetry/opentelemetry-collector/tree/main/cmd/builder#cgo-disabled-by-default
+  cgo_enabled: true
+
+replaces:
+  - github.com/intel/level-zero-go => ../level-zero-go
+  - github.com/intel/xpumanager/xpumd => ../
+  - github.com/intel/xpumanager/xpumd/common => ../common
+  - github.com/intel/xpumanager/xpumd/exporter/intelxpuinfo/api => ../exporter/intelxpuinfo/api
+
+exporters:
+  - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.162.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.162.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/prometheusexporter v0.162.0
+  - gomod: github.com/intel/xpumanager/xpumd/exporter/intelxpuinfo v0.0.0
+    path: ./exporter/intelxpuinfo
+    name: intelxpuinfoexporter
+
+receivers:
+  - gomod: github.com/intel/xpumanager/xpumd/receiver/intelxpu v0.0.0
+    path: ./receiver/intelxpu
+    name: intelxpureceiver
+  - gomod: github.com/intel/xpumanager/xpumd/receiver/intelcrashlog v0.0.0
+    path: ./receiver/intelcrashlog
+    name: intelcrashlogreceiver
+
+processors:
+  - gomod: github.com/intel/xpumanager/xpumd/processor/intelxpustatus v0.0.0
+    path: ./processor/intelxpustatus
+    name: intelxpustatus
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/filterprocessor v0.162.0
+
+extensions:
+  - gomod: github.com/intel/xpumanager/xpumd/extension/inteldevicewatch v0.0.0
+    path: ./extension/inteldevicewatch
+    name: inteldevicewatch

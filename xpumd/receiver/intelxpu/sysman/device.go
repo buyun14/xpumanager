@@ -8,7 +8,9 @@ package sysman
 import (
 	"fmt"
 	"iter"
+	"maps"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 
@@ -19,6 +21,10 @@ import (
 	l0intel "github.com/intel/level-zero-go/sysman/exp/intel"
 	"github.com/intel/xpumanager/xpumd/receiver/intelxpu/sysman/internal/metadata"
 )
+
+func init() {
+	registerSubsystem("device", enumDeviceMetrics)
+}
 
 type deviceRegistry struct {
 	drivers []*driver
@@ -44,6 +50,14 @@ type device struct {
 	state        deviceState
 	scrapers     []instanceScraper
 
+	deviceConfig
+}
+
+// deviceConfig is the device configuration resolved from the receiver configuration.
+type deviceConfig struct {
+	// subsystems are the configuration-enabled subsystems to enumerate.
+	subsystems []subsystem
+	// aggregatedMetricsBufferSize is the size of the buffer for aggregated metrics.
 	aggregatedMetricsBufferSize int
 }
 
@@ -55,9 +69,11 @@ type pciState struct {
 	stats         *l0sysman.PciStats
 }
 
-// pciConstMetrics holds device PCI metric values that are determined once and do not change afterwards.
+// pciConstMetrics holds the device PCI properties the PCI metrics depend on,
+// determined once at init and not changing afterwards.
 type pciConstMetrics struct {
-	maxBandwidth int64 // zero = not available
+	maxBandwidth          int64 // zero = not available
+	haveBandwidthCounters bool
 }
 
 type eccState struct {
@@ -108,6 +124,8 @@ type deviceAttributes struct {
 func newDeviceRegistry(logger *zap.SugaredLogger, cfg *Config) (*deviceRegistry, error) {
 	reg := &deviceRegistry{}
 
+	devCfg := newDeviceConfig(logger, cfg)
+
 	drivers, err := l0sysman.DriverGet()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ZES drivers: %w", err)
@@ -115,7 +133,7 @@ func newDeviceRegistry(logger *zap.SugaredLogger, cfg *Config) (*deviceRegistry,
 	logger.Debugw("Sysman drivers", "enumerated", len(drivers))
 
 	for i, drv := range drivers {
-		devs, err := enumDevices(drv, logger, cfg.aggregatedMetricsBufferSize)
+		devs, err := enumDevices(drv, logger, devCfg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to enumerate devices for driver %d/%d: %w", i+1, len(drivers), err)
 		}
@@ -131,6 +149,22 @@ func newDeviceRegistry(logger *zap.SugaredLogger, cfg *Config) (*deviceRegistry,
 	}
 
 	return reg, nil
+}
+
+// newDeviceConfig resolves the device configuration from the receiver configuration.
+func newDeviceConfig(logger *zap.SugaredLogger, cfg *Config) deviceConfig {
+	devCfg := deviceConfig{
+		aggregatedMetricsBufferSize: cfg.aggregatedMetricsBufferSize,
+	}
+	// Sorted for a deterministic scrape order
+	for _, name := range slices.Sorted(maps.Keys(subsystems)) {
+		if !cfg.subsystemEnabled(name) {
+			logger.Infow("subsystem skipped: disabled in the configuration", "subsystem", name)
+			continue
+		}
+		devCfg.subsystems = append(devCfg.subsystems, subsystems[name])
+	}
+	return devCfg
 }
 
 func (r *deviceRegistry) scrape(mb *metadata.MetricsBuilder, ts pcommon.Timestamp) {
@@ -157,7 +191,7 @@ func (r *deviceRegistry) devices() iter.Seq[*device] {
 	}
 }
 
-func enumDevices(driver *l0sysman.Driver, logger *zap.SugaredLogger, aggregatedMetricsBufferSize int) ([]*device, error) {
+func enumDevices(driver *l0sysman.Driver, logger *zap.SugaredLogger, cfg deviceConfig) ([]*device, error) {
 	zesDevs, err := driver.DeviceGet()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ZES devices: %w", err)
@@ -167,14 +201,20 @@ func enumDevices(driver *l0sysman.Driver, logger *zap.SugaredLogger, aggregatedM
 	devs := make([]*device, 0, len(zesDevs))
 	for i, d := range zesDevs {
 		name := fmt.Sprintf("gpu-%d", i+1) // match error log index
-		devs = append(devs, newDevice(name, d, logger, aggregatedMetricsBufferSize))
+		if pci, err := d.PciGetProperties(); err == nil {
+			if bdf := pciBDF(pci.Address); isPciVF(bdf) {
+				logger.Infow("Sysman device is a PCI virtual function, skipped", "name", name, "BDF", bdf)
+				continue
+			}
+		}
+		devs = append(devs, newDevice(name, d, logger, cfg))
 	}
 
 	return devs, nil
 }
 
 // newDevice creates a new device. Use init() to scan the device.
-func newDevice(name string, dev *l0sysman.Device, logger *zap.SugaredLogger, aggregatedMetricsBufferSize int) *device {
+func newDevice(name string, dev *l0sysman.Device, logger *zap.SugaredLogger, cfg deviceConfig) *device {
 	d := &device{
 		Device: dev,
 		logger: logger,
@@ -182,7 +222,7 @@ func newDevice(name string, dev *l0sysman.Device, logger *zap.SugaredLogger, agg
 			HwName:    name,
 			hwNamePci: name + "-pci",
 		},
-		aggregatedMetricsBufferSize: aggregatedMetricsBufferSize,
+		deviceConfig: cfg,
 	}
 
 	if err := d.init(); err != nil {
@@ -203,6 +243,13 @@ func (d *device) init() error {
 		return fmt.Errorf("device GetProperties() failed: %w", err)
 	}
 
+	serialNumber := props.SerialNumber.String()
+	// https://oneapi-src.github.io/level-zero-spec/level-zero/latest/sysman/api/apis/device-2.html#zes-device-properties-t
+	if serialNumber == "unknown" && props.OemSerialId != "" {
+		// xpu-smi fallbacks to OEM ID
+		serialNumber = props.OemSerialId
+	}
+
 	// Preserve name fields assigned at construction, refresh everything else.
 	d.attributes = deviceAttributes{
 		HwName:    d.attributes.HwName,
@@ -212,7 +259,7 @@ func (d *device) init() error {
 		PciDeviceID:          fmt.Sprintf("%04x", props.Core.DeviceId),
 		PciVendorID:          fmt.Sprintf("%04x", props.Core.VendorId),
 		HwModel:              props.ModelName.String(),
-		HwSerialNumber:       props.SerialNumber.String(),
+		HwSerialNumber:       serialNumber,
 		HwVendor:             props.VendorName.String(),
 		SubdeviceCount:       int64(props.NumSubdevices),
 		HwGpuType:            gpuType(props.Flags),
@@ -249,42 +296,22 @@ func (d *device) init() error {
 		if pci.MaxSpeed.Width > 0 {
 			d.attributes.PciLanes = fmt.Sprintf("%d", pci.MaxSpeed.Width)
 		}
+		d.constMetrics.haveBandwidthCounters = pci.HaveBandwidthCounters.IsTrue()
+		if !d.constMetrics.haveBandwidthCounters {
+			d.logger.Infow("Device PciGetProperties(): PCI BW counters not available", "attributes", d.attributes)
+		}
 		if pci.MaxSpeed.MaxBandwidth > 0 {
-			d.constMetrics = pciConstMetrics{maxBandwidth: pci.MaxSpeed.MaxBandwidth}
+			d.constMetrics.maxBandwidth = pci.MaxSpeed.MaxBandwidth
 		} else {
 			d.logger.Infow("Device PciGetProperties(): PCI max BW not available", "attributes", d.attributes)
 		}
-		if pci.HaveBandwidthCounters.IsTrue() {
-			if stats, err := d.PciGetStats(); err == nil {
-				d.state.pci.stats = &stats
-			} else {
-				d.logger.Infow("Device PciGetStats() failed: PCI BW not available", zap.Error(err), "attributes", d.attributes)
-			}
-		} else {
-			d.logger.Infow("Device PciGetProperties(): PCI BW counters not available", "attributes", d.attributes)
-		}
-	}
-
-	// Check device + PCI state availability
-	if _, err := d.GetState(); err != nil {
-		d.logger.Infow("Device GetState() failed: device state not available", zap.Error(err), "attributes", d.attributes)
-		d.state.devStateDisabled = true
-	}
-	if _, err := d.PciGetState(); err != nil {
-		d.logger.Infow("Device PciGetState() failed: PCI state not available", zap.Error(err), "attributes", d.attributes)
-		d.state.pci.stateDisabled = true
-	}
-	// Check availability of the (optional) device health extension
-	if _, err := d.GetHealthStatusExt(); err != nil {
-		d.logger.Infow("Device GetHealthStatusExt() failed: complete device health status not available", zap.Error(err), "attributes", d.attributes)
-		d.state.health.disabled = true
 	}
 
 	// TODO: report types & sizes of device PCI BARs?
 	// https://oneapi-src.github.io/level-zero-spec/level-zero/1.17.24/sysman/api.html#zesdevicepcigetbars
 
 	// After this, enumerations do enough logging for timing info to be available at adequate granularity
-	d.logger.Debugw("Device init() state + PCI props done", "name", d.attributes.HwName, "BDF", d.attributes.PciBDF)
+	d.logger.Debugw("Device init() PCI props done", "name", d.attributes.HwName, "BDF", d.attributes.PciBDF)
 
 	// Enumerate device firmwares into versions attribute
 	fwInfos := []string{}
@@ -293,8 +320,8 @@ func (d *device) init() error {
 	}
 	d.attributes.HwFirmwareVersion = strings.Join(fwInfos, ",")
 
-	// Enumerate all device metrics
-	for _, s := range subsystems {
+	// Enumerate the device metrics of the enabled subsystems
+	for _, s := range d.subsystems {
 		d.scrapers = append(d.scrapers, s.enumDevice(d)...)
 	}
 
@@ -368,8 +395,7 @@ func (d *device) scrape(mb *metadata.MetricsBuilder, ts pcommon.Timestamp) {
 	if !d.state.initialized {
 		return
 	}
-	d.scrapeEccState(mb, ts)
-
+	// reported also with the device subsystem disabled
 	mb.RecordHwGpuInfoDataPoint(ts, 1,
 		d.attributes.HwID,
 		d.attributes.HwName,
@@ -388,6 +414,49 @@ func (d *device) scrape(mb *metadata.MetricsBuilder, ts pcommon.Timestamp) {
 		d.attributes.HwGpuEccSupport,
 	)
 
+	for _, s := range d.scrapers {
+		s.scrape(mb, ts)
+	}
+}
+
+// deviceMetrics is the scraper of the device-level metrics.
+type deviceMetrics struct {
+	dev *device
+}
+
+// enumDeviceMetrics checks the availability of the device-level metrics.
+func enumDeviceMetrics(d *device) []instanceScraper {
+	if d.constMetrics.haveBandwidthCounters {
+		if stats, err := d.PciGetStats(); err == nil {
+			d.state.pci.stats = &stats
+		} else {
+			d.logger.Infow("Device PciGetStats() failed: PCI BW not available", zap.Error(err), "attributes", d.attributes)
+		}
+	}
+
+	// Check device + PCI state availability
+	if _, err := d.GetState(); err != nil {
+		d.logger.Infow("Device GetState() failed: device state not available", zap.Error(err), "attributes", d.attributes)
+		d.state.devStateDisabled = true
+	}
+	if _, err := d.PciGetState(); err != nil {
+		d.logger.Infow("Device PciGetState() failed: PCI state not available", zap.Error(err), "attributes", d.attributes)
+		d.state.pci.stateDisabled = true
+	}
+
+	// Check availability of the (optional) device health extension
+	if _, err := d.GetHealthStatusExt(); err != nil {
+		d.logger.Infow("Device GetHealthStatusExt() failed: complete device health status not available", zap.Error(err), "attributes", d.attributes)
+		d.state.health.disabled = true
+	}
+
+	return []instanceScraper{&deviceMetrics{dev: d}}
+}
+
+func (m *deviceMetrics) scrape(mb *metadata.MetricsBuilder, ts pcommon.Timestamp) {
+	d := m.dev
+	d.scrapeEccState(mb, ts)
+
 	status := &stateAggregator{}
 	d.scrapeDevState(mb, ts, status)
 	d.scrapeHealthStatus(mb, ts, status)
@@ -396,11 +465,9 @@ func (d *device) scrape(mb *metadata.MetricsBuilder, ts pcommon.Timestamp) {
 
 	d.scrapePciState(mb, ts)
 	d.scrapePciStats(mb, ts)
-
-	for _, s := range d.scrapers {
-		s.scrape(mb, ts)
-	}
 }
+
+func (m *deviceMetrics) pollAggregatedMetrics() {}
 
 // scrapeEccState reports the device memory ECC state(s). States are reported
 // only if the ECC state is configurable, or if it has changed.

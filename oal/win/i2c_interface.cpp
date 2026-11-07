@@ -51,26 +51,67 @@ public:
  * @brief Constructor for I2CInterface class on Windows platform
  *
  * Initializes the I2C interface for communication with AMC devices on Windows.
- * Opens the specified device path and establishes communication channel.
+ * The device is opened exclusively, which is the lock, so it is not opened here;
+ * tryLock() opens it and unlock() closes it.
  *
- * @param devpath Wide character string containing the device path (e.g., L"\\\\.\\NF_I2C_BUS_0x...")
+ * @param path Wide character string containing the device path (e.g., L"\\\\.\\NF_I2C_BUS_0x...")
  *
- * @note Sets init flag to true on successful initialization, false otherwise
+ * @note Sets init flag to true when a device path is given, false otherwise
  * @note Uses Windows-specific file handles and overlapped I/O for device communication
  */
-I2CInterface::I2CInterface(const std::string &devpath)
+I2CInterface::I2CInterface(const std::string &path) : amcDevicePath(path)
 {
 	TRACING();
 
 	amchandle = NULL;
-	init = false;
-
-	if (openAmc(devpath) && open_amc_peripheral()) {
-		init = true;
-	} else {
-		ERR("Failed to open AMC device handle\n");
-		init = false;
+	peripheralEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+	init = !amcDevicePath.empty() && peripheralEvent != NULL;
+	if (amcDevicePath.empty()) {
+		ERR("Device path is empty\n");
+	} else if (peripheralEvent == NULL) {
+		ERR("Failed to create event for the AMC peripheral: {}\n", GetLastError());
 	}
+}
+
+/**
+ * @brief Opens the AMC device exclusively, which keeps other processes off the AMC bus
+ *
+ * Does not wait. Returns true at once if this object already holds the device.
+ *
+ * @retval true  The device is open and the peripheral is ready.
+ * @retval false Another process holds the device (isBusy() is then true), or opening it failed.
+ */
+bool I2CInterface::tryLock()
+{
+	TRACING();
+	busy = false;
+	if (amchandle != NULL) {
+		return true;
+	}
+	if (openAmc(amcDevicePath) && open_amc_peripheral()) {
+		return true;
+	}
+	if (!busy) {
+		ERR("Failed to open AMC device handle\n");
+	}
+	unlock();
+	return false;
+}
+
+/**
+ * @brief Closes the AMC device so other processes can open it
+ */
+void I2CInterface::unlock()
+{
+	TRACING();
+	if (amchandle != NULL && peripheralPending) {
+		DWORD bytesReturned = 0;
+		CancelIoEx(amchandle, &peripheralOverlapped);
+		GetOverlappedResult(amchandle, &peripheralOverlapped, &bytesReturned, TRUE);
+	}
+	peripheralPending = false;
+	closeAmc();
+	amchandle = NULL;
 }
 
 /**
@@ -84,8 +125,9 @@ I2CInterface::I2CInterface(const std::string &devpath)
 I2CInterface::~I2CInterface()
 {
 	TRACING();
-	if (amchandle != NULL) {
-		CloseHandle(amchandle);
+	unlock();
+	if (peripheralEvent != NULL) {
+		CloseHandle(peripheralEvent);
 	}
 }
 
@@ -116,7 +158,12 @@ bool I2CInterface::openAmc(const std::string &devpath)
 							FILE_FLAG_OVERLAPPED, nullptr);
 
 	if (amchandle == INVALID_HANDLE_VALUE) {
-		ERR("Error openAmc - {}\n", GetLastError());
+		DWORD err = GetLastError();
+		busy = (err == ERROR_SHARING_VIOLATION);
+		amchandle = NULL;
+		if (!busy) {
+			ERR("Error openAmc - {}\n", err);
+		}
 		return false;
 	}
 
@@ -132,15 +179,14 @@ bool I2CInterface::openAmc(const std::string &devpath)
  *
  * @return true if peripheral opened successfully, false on failure
  *
- * @note Uses overlapped I/O structure for asynchronous operation
+ * @note Uses the member OVERLAPPED, which unlock() waits on before the handle is closed
  * @note Expects ERROR_IO_PENDING as normal behavior for this IOCTL
  */
 bool I2CInterface::open_amc_peripheral()
 {
 	TRACING();
-	ULONG bytesReturned;
+	ULONG bytesReturned = 0;
 	ULONG peripheralindex = 0;
-	OVERLAPPED overlapped = {};
 
 	if (amchandle == nullptr) {
 		ERR("File is null\n");
@@ -150,11 +196,15 @@ bool I2CInterface::open_amc_peripheral()
 	// amchandle was opened with the FILE_FLAG_OVERLAPPED flag, the operation is performed
 	// as an overlapped (asynchronous) operation. DeviceIoControl returns immediately,
 	// Expects ERROR_IO_PENDING as normal behavior for this IOCTL
-	DeviceIoControl(amchandle, IOCTL_SPBTESTTOOL_OPEN, &peripheralindex, sizeof(ULONG), nullptr, 0, &bytesReturned,
-					&overlapped);
-	if (GetLastError() != ERROR_IO_PENDING) {
-		ERR("Error open_amc_peripheral - {}\n", GetLastError());
-		return false;
+	peripheralOverlapped = {};
+	peripheralOverlapped.hEvent = peripheralEvent;
+	if (!DeviceIoControl(amchandle, IOCTL_SPBTESTTOOL_OPEN, &peripheralindex, sizeof(ULONG), nullptr, 0, &bytesReturned,
+						 &peripheralOverlapped)) {
+		if (GetLastError() != ERROR_IO_PENDING) {
+			ERR("Error open_amc_peripheral - {}\n", GetLastError());
+			return false;
+		}
+		peripheralPending = true;
 	}
 	DBG("open_amc_peripheral Success\n");
 	return true;
@@ -207,6 +257,8 @@ bool I2CInterface::writeAmc(void *writebuffer, size_t writesize)
 			} else {
 				ERR("WaitForSingleObject timeout or error: {}\n", GetLastError());
 				CancelIo(amchandle);
+				// The kernel writes the stack OVERLAPPED when the cancel completes, so wait for it
+				GetOverlappedResult(amchandle, &overlapped, &byteswritten, TRUE);
 				return false;
 			}
 		} else {
@@ -271,6 +323,8 @@ bool I2CInterface::readAmc(void *readbuffer, size_t readsize)
 			} else {
 				ERR("WaitForSingleObject timeout or error: {}\n", GetLastError());
 				CancelIo(amchandle);
+				// The kernel writes the stack OVERLAPPED when the cancel completes, so wait for it
+				GetOverlappedResult(amchandle, &overlapped, &bytesread, TRUE);
 				return false;
 			}
 		} else {
@@ -297,10 +351,14 @@ bool I2CInterface::readAmc(void *readbuffer, size_t readsize)
 bool I2CInterface::closeAmc()
 {
 	TRACING();
-	if (amchandle != NULL) {
-		return CloseHandle(amchandle);
+	if (amchandle == NULL) {
+		return true;
 	}
-	return true;
+
+	const bool closed = CloseHandle(amchandle) != 0;
+	amchandle = NULL;
+	init = false;
+	return closed;
 }
 
 /**

@@ -130,9 +130,9 @@ template <zes_ras_error_category_exp_t CAT> bool isRasCategory(zes_ras_error_cat
  *
  * @tparam TYPES  Error set types to include.
  * @tparam FILTER Categories to include.
- * @param[in]  d      Device to query.
- * @param[out] out    On success, set to the decimal sum. Unchanged on failure.
- * @param      unused Unused metric cache parameter.
+ * @param[in]  d     Device to query.
+ * @param[out] out   On success, set to the decimal sum. Unchanged on failure.
+ * @param[in]  cache Holds the RAS states once read, so the other ECC fields reuse them.
  *
  * @retval ZE_RESULT_SUCCESS                   The sum was written to @p out.
  * @retval ZE_RESULT_ERROR_UNSUPPORTED_FEATURE The device exposes no RAS error sets, or none of them
@@ -140,17 +140,21 @@ template <zes_ras_error_category_exp_t CAT> bool isRasCategory(zes_ras_error_cat
  * @retval Other                               Any other error returned while reading the RAS states.
  */
 template <RasTypes TYPES, RasCategoryFilter FILTER>
-ze_result_t rasErrorGetter(devInfo &d, MetricValue &out, const MetricCache & /*unused*/)
+ze_result_t rasErrorGetter(devInfo &d, MetricValue &out, const MetricCache &cache)
 {
-	auto *rasHal = d.dev->getRAS();
-	if (rasHal == nullptr) {
-		return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+	if (!cache.rasRead) {
+		auto *rasHal = d.dev->getRAS();
+		if (rasHal == nullptr) {
+			return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+		}
+		RasRead read;
+		read.status = rasHal->getErrorsPerTileRasExp(read.states);
+		cache.rasRead = std::move(read);
 	}
-	RasStates states;
-	if (const auto res = rasHal->getErrorsPerTileRasExp(states); res != ZE_RESULT_SUCCESS) {
-		return res;
+	if (cache.rasRead->status != ZE_RESULT_SUCCESS) {
+		return cache.rasRead->status;
 	}
-	const auto sum = sumRasErrors(states, TYPES, FILTER);
+	const auto sum = sumRasErrors(cache.rasRead->states, TYPES, FILTER);
 	if (!sum) {
 		return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
 	}
@@ -254,6 +258,171 @@ constexpr auto ECC_METRICS = std::to_array<QueryMetric>({
 		.source = MetricSource::Live,
 		.groups = MetricGroup::ECC,
 		.getter = rasErrorGetter<RasTypes::BOTH, isRasCategory<ZES_RAS_ERROR_CATEGORY_EXP_NON_COMPUTE_ERRORS>>,
+	},
+	{
+		.name = "ecc.mode.pending",
+		.unit = "",
+		.description = "ECC state after the next reset: Enabled or Disabled",
+		.source = MetricSource::Live,
+		.groups = MetricGroup::ECC,
+		.getter = [](devInfo &d, MetricValue &out, const MetricCache &) -> ze_result_t {
+			auto *ecc = d.dev->getECC();
+			if (ecc == nullptr) {
+				return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+			}
+			zes_device_ecc_properties_t props{};
+			props.stype = ZES_STRUCTURE_TYPE_DEVICE_ECC_PROPERTIES;
+			if (auto const r = ecc->getState(d.zesDeviceHdl, &props); r != ZE_RESULT_SUCCESS) {
+				return r;
+			}
+			switch (props.pendingState) {
+			case ZES_DEVICE_ECC_STATE_ENABLED:
+				out = "Enabled";
+				return ZE_RESULT_SUCCESS;
+			case ZES_DEVICE_ECC_STATE_DISABLED:
+				out = "Disabled";
+				return ZE_RESULT_SUCCESS;
+			default:
+				// The driver says it has no pending state, as on CRI, where ECC is not configurable.
+				return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+			}
+		},
+	},
+	{
+		.name = "memory.offline_pages",
+		.unit = "",
+		.description = "Device memory pages the driver has taken offline after errors (retired pages)",
+		.source = MetricSource::Live,
+		.groups = MetricGroup::ECC,
+		.getter = [](devInfo &d, MetricValue &out, const MetricCache &) -> ze_result_t {
+			auto *pages = d.dev->getPageOffline();
+			if (pages == nullptr) {
+				return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+			}
+			uint32_t count = 0;
+			if (auto const r = pages->getDeviceMemoryPageOfflineState(&count, nullptr); r != ZE_RESULT_SUCCESS) {
+				return r;
+			}
+			out = xpum::compat::format("{}", count);
+			return ZE_RESULT_SUCCESS;
+		},
+	},
+	{
+		.name = "memory.repair_status",
+		.unit = "",
+		.description = "Whether the device has had a repair performed, such as remapping faulty memory: "
+					   "Performed or Not Performed",
+		.source = MetricSource::Live,
+		.groups = MetricGroup::ECC,
+		.getter = [](devInfo &d, MetricValue &out, const MetricCache &) -> ze_result_t {
+			zes_repair_status_t status = ZES_REPAIR_STATUS_UNSUPPORTED;
+			if (auto const r = d.dev->getRepairStatus(status); r != ZE_RESULT_SUCCESS) {
+				return r;
+			}
+			if (status == ZES_REPAIR_STATUS_UNSUPPORTED) {
+				return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+			}
+			out = status == ZES_REPAIR_STATUS_PERFORMED ? "Performed" : "Not Performed";
+			return ZE_RESULT_SUCCESS;
+		},
+	},
+	// The categories the xe kernel's netlink RAS interface reports, as on CRI.
+	{
+		.name = "ras.memory.errors.correctable",
+		.unit = "",
+		.description = "Correctable device memory errors",
+		.source = MetricSource::Live,
+		.groups = MetricGroup::ECC,
+		.getter = rasErrorGetter<RasTypes::CORRECTABLE, isRasCategory<ZES_RAS_ERROR_CATEGORY_EXP_MEMORY_ERRORS>>,
+	},
+	{
+		.name = "ras.memory.errors.uncorrectable",
+		.unit = "",
+		.description = "Uncorrectable device memory errors",
+		.source = MetricSource::Live,
+		.groups = MetricGroup::ECC,
+		.getter = rasErrorGetter<RasTypes::UNCORRECTABLE, isRasCategory<ZES_RAS_ERROR_CATEGORY_EXP_MEMORY_ERRORS>>,
+	},
+	{
+		.name = "ras.pcie.errors.correctable",
+		.unit = "",
+		.description = "Correctable PCIe subsystem errors",
+		.source = MetricSource::Live,
+		.groups = MetricGroup::ECC,
+		.getter = rasErrorGetter<RasTypes::CORRECTABLE, isRasCategory<ZES_RAS_ERROR_CATEGORY_EXP_PCIE_ERRORS>>,
+	},
+	{
+		.name = "ras.pcie.errors.uncorrectable",
+		.unit = "",
+		.description = "Uncorrectable PCIe subsystem errors",
+		.source = MetricSource::Live,
+		.groups = MetricGroup::ECC,
+		.getter = rasErrorGetter<RasTypes::UNCORRECTABLE, isRasCategory<ZES_RAS_ERROR_CATEGORY_EXP_PCIE_ERRORS>>,
+	},
+	{
+		.name = "ras.soc_internal.errors.correctable",
+		.unit = "",
+		.description = "Correctable SoC internal errors",
+		.source = MetricSource::Live,
+		.groups = MetricGroup::ECC,
+		.getter = rasErrorGetter<RasTypes::CORRECTABLE, isRasCategory<ZES_RAS_ERROR_CATEGORY_EXP_SOC_INTERNAL_ERRORS>>,
+	},
+	{
+		.name = "ras.soc_internal.errors.uncorrectable",
+		.unit = "",
+		.description = "Uncorrectable SoC internal errors",
+		.source = MetricSource::Live,
+		.groups = MetricGroup::ECC,
+		.getter =
+			rasErrorGetter<RasTypes::UNCORRECTABLE, isRasCategory<ZES_RAS_ERROR_CATEGORY_EXP_SOC_INTERNAL_ERRORS>>,
+	},
+	{
+		.name = "ras.compute.errors.correctable",
+		.unit = "",
+		.description = "Correctable compute engine errors",
+		.source = MetricSource::Live,
+		.groups = MetricGroup::ECC,
+		.getter = rasErrorGetter<RasTypes::CORRECTABLE, isRasCategory<ZES_RAS_ERROR_CATEGORY_EXP_COMPUTE_ERRORS>>,
+	},
+	{
+		.name = "ras.compute.errors.uncorrectable",
+		.unit = "",
+		.description = "Uncorrectable compute engine errors",
+		.source = MetricSource::Live,
+		.groups = MetricGroup::ECC,
+		.getter = rasErrorGetter<RasTypes::UNCORRECTABLE, isRasCategory<ZES_RAS_ERROR_CATEGORY_EXP_COMPUTE_ERRORS>>,
+	},
+	{
+		.name = "ras.fabric.errors.correctable",
+		.unit = "",
+		.description = "Correctable fabric interconnect errors",
+		.source = MetricSource::Live,
+		.groups = MetricGroup::ECC,
+		.getter = rasErrorGetter<RasTypes::CORRECTABLE, isRasCategory<ZES_RAS_ERROR_CATEGORY_EXP_FABRIC_ERRORS>>,
+	},
+	{
+		.name = "ras.fabric.errors.uncorrectable",
+		.unit = "",
+		.description = "Uncorrectable fabric interconnect errors",
+		.source = MetricSource::Live,
+		.groups = MetricGroup::ECC,
+		.getter = rasErrorGetter<RasTypes::UNCORRECTABLE, isRasCategory<ZES_RAS_ERROR_CATEGORY_EXP_FABRIC_ERRORS>>,
+	},
+	{
+		.name = "ras.scale.errors.correctable",
+		.unit = "",
+		.description = "Correctable scale fabric errors",
+		.source = MetricSource::Live,
+		.groups = MetricGroup::ECC,
+		.getter = rasErrorGetter<RasTypes::CORRECTABLE, isRasCategory<ZES_RAS_ERROR_CATEGORY_EXP_SCALE_ERRORS>>,
+	},
+	{
+		.name = "ras.scale.errors.uncorrectable",
+		.unit = "",
+		.description = "Uncorrectable scale fabric errors",
+		.source = MetricSource::Live,
+		.groups = MetricGroup::ECC,
+		.getter = rasErrorGetter<RasTypes::UNCORRECTABLE, isRasCategory<ZES_RAS_ERROR_CATEGORY_EXP_SCALE_ERRORS>>,
 	},
 });
 } // namespace

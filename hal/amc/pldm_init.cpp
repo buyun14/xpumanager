@@ -4,6 +4,7 @@
  *
  */
 
+#include "amc_update_interrupt.h"
 #include "pldm.h"
 
 /**
@@ -135,6 +136,7 @@ int pldm::initialize()
  *                     transferred, and every other component in the package is left alone. Used to
  *                     take the AMC component out of a composite package that also carries images
  *                     flashed through other interfaces. Zero transfers every component.
+ * @param forceUpdate  Allow a forced (downgrade) update of components that support it
  *
  * @return int Status of firmware update operation
  * @retval PLDM_SUCCESS Firmware update completed successfully
@@ -142,7 +144,7 @@ int pldm::initialize()
  *
  * @note The device must be properly initialized before calling this function
  */
-int pldm::fwupd(const char *pkgFilePath, uint16_t compIdFilter)
+int pldm::fwupd(const char *pkgFilePath, uint16_t compIdFilter, bool forceUpdate)
 {
 	TRACING();
 	if (!i2cobj->isInit()) {
@@ -151,6 +153,10 @@ int pldm::fwupd(const char *pkgFilePath, uint16_t compIdFilter)
 	}
 
 	mCompIdFilter = compIdFilter;
+	mForceUpdate = forceUpdate;
+
+	// Turns Ctrl+C / SIGTERM into a CancelUpdate for as long as the update runs
+	AmcUpdateInterruptGuard interruptGuard;
 
 	if (fwUpdInitialize(pkgFilePath) != PLDM_SUCCESS) {
 		ERR("Firmware update failed\n");

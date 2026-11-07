@@ -10,7 +10,13 @@ See the [Crash Log Framework project](https://github.com/intel/crashlog) for mor
 > [!CAUTION]
 > Crashlog files must be created atomically (e.g. by writing to a temporary
 > file and then renaming it) to avoid the receiver processing an incomplete
+> file. The temporary file must be outside the watched directory or have a
+> name that does not match any of the `globs` (e.g. `crash.bin.tmp` with the
+> `*.bin` glob). Otherwise, the receiver also emits the incomplete temporary
 > file.
+
+Only regular files are processed. Symlinks are not followed and other
+non-regular files (directories, FIFOs, devices, ...) are skipped.
 
 ## Configuration
 
@@ -22,6 +28,8 @@ receivers:
     directory: /var/log/crashlog
     globs: ["*.crashlog"]
     ignore_older_than: 10m
+    max_file_size: 4194304
+    min_file_size: 64
     add_attributes:
       hw.vendor: ACME
 ```
@@ -33,7 +41,17 @@ receivers:
 | `directory` | string | *required* | Directory to watch for new crashlog files |
 | `globs` | []string | *required* | Filename glob patterns matched against the base name of each file, e.g. `["*.bin", "*.crashlog"]`. A file is processed if it matches any of them, use `["*"]` to match all files |
 | `ignore_older_than` | duration | `0s` | Ignore files whose modification time is older than `startup_time - ignore_older_than`. `0s` means only files modified after startup are processed |
+| `max_file_size` | int | `1048576` (1 MiB) | Maximum crashlog file size in bytes, must be positive. Larger files are skipped |
+| `min_file_size` | int | `1` | Minimum crashlog file size in bytes, must not be negative or greater than `max_file_size`. Smaller files are skipped. The default skips empty files |
 | `add_attributes` | map[string]string | `{}` | Static key/value attributes added to every emitted log record |
+
+> [!CAUTION]
+> The receiver does not persist the list of processed files across daemon
+> restarts. With the default `ignore_older_than: 0s`, crashlog files created
+> while the receiver is not running (e.g. during a restart or upgrade) are
+> never emitted. A non-zero value can create duplicates: it collects also older
+> files, but files that were already emitted before a restart within that
+> window are re-emitted.
 
 ## Log Record Format
 
@@ -51,3 +69,7 @@ Each crashlog file produces a single log record:
 |-----------|------|-------------|
 | `file.name` | string | Base name of the crashlog file |
 | `pci.bdf` | string | PCI Bus:Device.Function address parsed from the filename (e.g. `0000:00:1e.2`). Omitted if no BDF is found in the filename |
+
+## Internal Telemetry
+
+See [documentation.md](documentation.md) for the emitted metrics.

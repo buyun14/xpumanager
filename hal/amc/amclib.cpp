@@ -7,6 +7,19 @@
 #include "amclib.h"
 #include "os.h"
 
+#include <chrono>
+#include <memory>
+#include <thread>
+
+namespace {
+
+// Covers the longest AMC operation of a discovery, first-use MCTP/PLDM init plus the FRU read
+// (about 2.4 s on CRI); a firmware update holds the bus far longer and is not waited out.
+constexpr auto AMC_BUS_WAIT = std::chrono::seconds{5};
+constexpr auto AMC_BUS_POLL = std::chrono::milliseconds{50};
+
+} // namespace
+
 /**
  * @brief Constructor for the amclib class
  *
@@ -29,6 +42,8 @@ amclib::amclib()
 	}
 
 	pldmobj = NULL;
+	cardState = nullptr;
+	cardMutex = nullptr;
 }
 
 /**
@@ -54,6 +69,11 @@ amclib::~amclib()
 		pldmobj = nullptr;
 	}
 
+	delete[] cardState;
+	cardState = nullptr;
+	delete[] cardMutex;
+	cardMutex = nullptr;
+
 	if (amcDeviceList != nullptr) {
 		delete amcDeviceList;
 		amcDeviceList = nullptr;
@@ -63,15 +83,12 @@ amclib::~amclib()
 /**
  * @brief Enumerates and initializes AMC firmware devices
  *
- * Discovers all available AMC devices in the system and creates pldm objects
- * for each device. This function must be called before any firmware operations.
+ * Discovers all available AMC devices in the system. No device is opened here;
+ * call amcInitialize() next, and each card is opened on first use.
  *
- * @return Number of AMC cards discovered and initialized, or -1 on error
- * @retval >0 Number of successfully initialized AMC devices
- * @retval -1 No devices found or initialization failed
- *
- * @note This function allocates memory for pldm objects. The destructor
- *       will handle cleanup if this function fails after partial allocation.
+ * @return Number of AMC cards discovered, or -1 on error
+ * @retval >0 Number of discovered AMC devices
+ * @retval -1 No devices found
  */
 int amclib::amcEnumFirmwares()
 {
@@ -87,51 +104,140 @@ int amclib::amcEnumFirmwares()
 }
 
 /**
- * @brief Initialize all discovered AMC devices
+ * @brief Prepare per-card state for all discovered AMC devices
  *
- * Performs initialization of pldm objects for all discovered AMC cards.
- * This is an internal function called by amcEnumFirmwares().
+ * Allocates a slot for each discovered card. No I2C device is opened here; each
+ * card's device is opened and initialized by acquireCard() the first time that
+ * card is used. This keeps one process from locking every AMC in the system when
+ * it only needs one, so separate processes can work on separate cards concurrently.
  *
  * @return Status of initialization
- * @retval AMC_SUCCESS All devices initialized successfully
- * @retval AMC_ERROR One or more devices failed to initialize
+ * @retval AMC_SUCCESS Per-card state allocated
+ * @retval AMC_ERROR No cards enumerated
  *
- * @note This is a private member function
+ * @note amcEnumFirmwares() must be called first
  */
 int amclib::amcInitialize()
 {
 	TRACING();
 
-	pldmobj = new pldm *[numCards];
-	if (pldmobj == nullptr) {
-		ERR("Failed to allocate memory for pldm object array\n");
+	if (numCards <= 0) {
+		ERR("No AMC cards enumerated\n");
 		return AMC_ERROR;
 	}
 
-	for (int i = 0; i < numCards; ++i) {
-		DBG("############ CARD : {:02} ############\n", i);
-		pldmobj[i] = new pldm(amcDeviceList->at(i).amcDevicePath, i);
-		if (pldmobj[i] == nullptr) {
-			ERR("Failed to allocate memory for pldm object for card : {}\n", i);
-			for (int j = 0; j < i; ++j) {
-				delete pldmobj[j];
-			}
-			delete[] pldmobj;
-			pldmobj = nullptr;
-			return AMC_ERROR;
-		}
-		DBG("#####################################\n\n");
+	if (pldmobj != nullptr) {
+		return AMC_SUCCESS;
 	}
 
-	for (int i = 0; i < numCards; i++) {
-		DBG("############ CARD : {:02} ############\n", i);
-		if (pldmobj[i]->initialize() != PLDM_SUCCESS) {
-			ERR("Failed to initialize pldm Object for card: {}\n", i);
-			return AMC_ERROR;
-		}
-		DBG("#####################################\n");
+	pldmobj = new pldm *[numCards]();
+	cardState = new std::atomic<int>[numCards];
+	cardMutex = new std::mutex[numCards];
+	for (int i = 0; i < numCards; ++i) {
+		cardState[i].store(CARD_UNINIT);
 	}
 	return AMC_SUCCESS;
+}
+
+/**
+ * @brief Take a card for one AMC operation, initializing it on first use
+ *
+ * Locks the card's in-process mutex, then its I2C bus, and runs the MCTP/PLDM init
+ * sequence the first time the card is used. Both locks are held until the returned
+ * lease is destroyed, so another process can use the card between operations.
+ *
+ * When another process holds the bus, waits up to AMC_BUS_WAIT for it. If that wait
+ * times out, the card stays uninitialized so a later call can retry, but later calls
+ * do not wait again until the bus has been acquired. Any other init failure is remembered, so a broken card is not
+ * re-probed on every call.
+ *
+ * @param cardNum Zero-based index of the AMC card
+ *
+ * @return A lease that is true when the card is ready for the operation
+ * @retval true  The card is initialized and its bus is locked by this process
+ * @retval false The card index is invalid, the card failed to initialize, or the bus stayed busy
+ */
+amclib::CardLease amclib::acquireCard(uint32_t cardNum)
+{
+	if (pldmobj == nullptr) {
+		ERR("PLDM objects not initialized\n");
+		return {};
+	}
+	if (cardNum >= static_cast<uint32_t>(numCards)) {
+		ERR("Invalid card number {} (valid range: 0-{})\n", cardNum, numCards - 1);
+		return {};
+	}
+
+	std::unique_lock<std::mutex> lock(cardMutex[cardNum]);
+	if (cardState[cardNum].load(std::memory_order_relaxed) == CARD_FAILED) {
+		DBG("AMC card {} failed to initialize earlier\n", cardNum);
+		return {};
+	}
+
+	if (pldmobj[cardNum] == nullptr) {
+		DBG("############ CARD : {:02} ############\n", cardNum);
+		auto card = std::make_unique<pldm>(amcDeviceList->at(cardNum).amcDevicePath, cardNum);
+		if (!card->isI2cOpen()) {
+			ERR("Failed to open the I2C device for AMC card {}\n", cardNum);
+			cardState[cardNum].store(CARD_FAILED, std::memory_order_relaxed);
+			return {};
+		}
+		pldmobj[cardNum] = card.release();
+	}
+	pldm *card = pldmobj[cardNum];
+
+	if (!lockBus(cardNum, card)) {
+		return {};
+	}
+	CardLease lease{lock.release(), card};
+
+	if (cardState[cardNum].load(std::memory_order_relaxed) == CARD_UNINIT) {
+		if (card->initialize() != PLDM_SUCCESS) {
+			ERR("Failed to initialize pldm Object for card: {}\n", cardNum);
+			cardState[cardNum].store(CARD_FAILED, std::memory_order_relaxed);
+			return {};
+		}
+		cardState[cardNum].store(CARD_READY, std::memory_order_release);
+		DBG("#####################################\n");
+	}
+	return lease;
+}
+
+/**
+ * @brief Lock a card's I2C bus, waiting a bounded time while another process holds it
+ *
+ * Reports a busy card once per busy period. Until the bus is free again, later calls for
+ * that card try once without waiting.
+ *
+ * @param cardNum Zero-based index of the AMC card, used for the message
+ * @param card    The card's pldm object
+ *
+ * @retval true  The bus is locked by this process
+ * @retval false The bus is still held by another process, or locking failed
+ */
+bool amclib::lockBus(uint32_t cardNum, pldm *card)
+{
+	const auto wait = card->mBusWaitExpired ? std::chrono::milliseconds{0} : AMC_BUS_WAIT;
+	const auto deadline = std::chrono::steady_clock::now() + wait;
+	while (!card->tryLockBus()) {
+		if (!card->isI2cBusy()) {
+			return false;
+		}
+		if (std::chrono::steady_clock::now() >= deadline) {
+			if (!card->mBusWaitExpired) {
+				// Expected while another process uses the card, so not an error: its data is just not
+				// available to this command.
+				DBG("AMC card {} (GPU {}) is in use by another process; its serial number and other AMC data are "
+					"unavailable\n",
+					cardNum, amcDeviceList->at(cardNum).gpuParentPath);
+				card->mBusWaitExpired = true;
+			}
+			return false;
+		}
+		std::this_thread::sleep_for(AMC_BUS_POLL);
+	}
+	card->mBusWaitExpired = false;
+	return true;
 }
 
 /**
@@ -144,6 +250,8 @@ int amclib::amcInitialize()
  * @param pkgFilePath Path to the firmware package file
  * @param compIdFilter When non-zero, only the component with this ComponentIdentifier is flashed.
  *                     Zero flashes every component the package carries.
+ * @param forceUpdate  Allow a forced (downgrade) update of components that support it. Passed with
+ *                     the flash, not set beforehand, so the card's bus is locked only once.
  *
  * @return Status of firmware flash operation
  * @retval AMC_SUCCESS Firmware flash completed successfully
@@ -152,69 +260,40 @@ int amclib::amcInitialize()
  * @note The card must be previously enumerated and initialized
  * @note Progress can be monitored using amcFirmwareProgress()
  */
-int amclib::amcFirmwareFlash(uint32_t cardNum, const char *pkgFilePath, uint16_t compIdFilter)
+int amclib::amcFirmwareFlash(uint32_t cardNum, const char *pkgFilePath, uint16_t compIdFilter, bool forceUpdate)
 {
 	TRACING();
-	if (!pldmobj) {
-		ERR("PLDM objects not initialized\n");
+	const CardLease card = acquireCard(cardNum);
+	if (!card) {
 		return AMC_ERROR;
 	}
-	int ret = pldmobj[cardNum]->fwupd(pkgFilePath, compIdFilter);
+	int ret = card->fwupd(pkgFilePath, compIdFilter, forceUpdate);
 	return (ret == PLDM_SUCCESS) ? AMC_SUCCESS : AMC_ERROR;
 }
 
 /**
- * @brief Arm the ForceUpdate flag on a specific AMC card's PLDM object
+ * @brief Get the firmware update progress of an AMC card
  *
- * Sets whether the next amcFirmwareFlash() call for the given card is allowed
- * to perform a forced (downgrade) update. This is stored as per-card state on
- * the underlying pldm object so concurrent updates on different AMCs remain
- * independent.
+ * Called while amcFirmwareFlash() runs on another thread. That thread locks the bus and
+ * initializes the card first, which can take several seconds while another process holds the
+ * bus; until then there is no progress to report.
  *
- * @param [in] cardNum Zero-based index of the AMC card
- * @param [in] forceUpdate true to allow forced/downgrade update, false for normal update
+ * @param cardNum Zero-based index of the AMC card
  *
- * @return Status of the operation
- * @retval AMC_SUCCESS Flag configured successfully
- * @retval AMC_ERROR Invalid card index or PLDM objects not initialized
- */
-int amclib::amcSetForceUpdate(uint32_t cardNum, bool forceUpdate)
-{
-	TRACING();
-	if (!pldmobj) {
-		ERR("PLDM objects not initialized\n");
-		return AMC_ERROR;
-	}
-	if (cardNum >= (uint32_t)numCards) {
-		ERR("Invalid cardNum specified: {}. Max cards: {}\n", cardNum, numCards);
-		return AMC_ERROR;
-	}
-	pldmobj[cardNum]->setForceUpdate(forceUpdate);
-	return AMC_SUCCESS;
-}
-
-/**
- * @brief Get firmware update progress for all AMC cards
- *
- * Retrieves the firmware update progress percentage for all cards
- * that are currently undergoing firmware update operations.
- *
- * @return Status of progress query
- * @retval 0 Progress retrieved successfully for all cards
- * @retval -1 Failed to get progress for one or more cards
- *
- * @note This function checks progress for all cards, not just active updates
+ * @return Progress of the update
+ * @retval 0-100 Percentage complete; 0 while the card is not yet initialized
+ * @retval -1    Invalid card index, or PLDM objects not initialized
  */
 int amclib::amcFirmwareProgress(uint32_t cardNum)
 {
 	TRACING();
-	if (cardNum >= (uint32_t)numCards) {
-		ERR("Invalid cardNum specified: {}. Max cards: {}\n", cardNum, numCards);
+	if (pldmobj == nullptr || cardNum >= static_cast<uint32_t>(numCards)) {
 		return -1;
 	}
-	if (!pldmobj) {
-		ERR("PLDM objects not initialized\n");
-		return -1;
+	// The flash thread holds the card's lease for the whole update, so progress is read without
+	// one. A ready card's pldm object is never replaced, so it can be read once the state says so.
+	if (cardState[cardNum].load(std::memory_order_acquire) != CARD_READY) {
+		return 0;
 	}
 	return pldmobj[cardNum]->fwupdProgress();
 }
@@ -274,13 +353,14 @@ int amclib::amcGetCardInfo(std::string gpuBDF, std::string &serialNumStr, std::s
 			uint8_t cardNum = static_cast<uint8_t>(i);
 			size_t bufferSize = sizeof(serialNum);
 			if (amcGetSerialNumber(cardNum, serialNum, &bufferSize) != AMC_SUCCESS) {
-				ERR("Failed to get serial number for card {}\n", i);
+				// The callee (or acquireCard) has already reported why
+				DBG("Failed to get serial number for card {}\n", i);
 				return -1;
 			}
 			serialNumStr = std::string(serialNum);
 
 			if (amcGetVersion(cardNum, amcVersion, &bufferSize) != AMC_SUCCESS) {
-				ERR("Failed to get version for card {}\n", i);
+				DBG("Failed to get version for card {}\n", i);
 				return -1;
 			}
 			versionStr = std::string(amcVersion);
@@ -312,17 +392,21 @@ int amclib::amcGetSensorInfoBySensorId(int cardIndex, uint16_t sensorId, std::ve
 {
 	TRACING();
 
-	if (!pldmobj || !pldmobj[cardIndex]) {
-		ERR("PLDM object not initialized for card index: {}\n", cardIndex);
+	if (cardIndex < 0) {
+		ERR("Invalid card index: {}\n", cardIndex);
+		return AMC_ERROR;
+	}
+	const CardLease card = acquireCard(static_cast<uint32_t>(cardIndex));
+	if (!card) {
 		return AMC_ERROR;
 	}
 
-	uint8_t ret = pldmobj[cardIndex]->getSensorInfoById(sensorId);
+	uint8_t ret = card->getSensorInfoById(sensorId);
 	if (ret != PLDM_SUCCESS) {
 		ERR("Failed to get sensor info for sensor ID {} on card index {}\n", sensorId, cardIndex);
 		return AMC_ERROR;
 	}
-	std::vector<pldmSensorInfo> &sensorInfoList = pldmobj[cardIndex]->getSensorInfoList();
+	std::vector<pldmSensorInfo> &sensorInfoList = card->getSensorInfoList();
 	for (const auto &sensor : sensorInfoList) {
 		if (sensor.sensorId == sensorId) {
 			amcSensorInfo info;
@@ -353,7 +437,8 @@ int amclib::oemVrsync(uint8_t cmd)
 {
 	TRACING();
 	for (int i = 0; i < numCards; i++) {
-		if (pldmobj[i]->oemVrsyncCmd(cmd) != PLDM_SUCCESS) {
+		const CardLease card = acquireCard(static_cast<uint32_t>(i));
+		if (!card || card->oemVrsyncCmd(cmd) != PLDM_SUCCESS) {
 			ERR("Failed to perform VRSync for card : {}\n", i);
 			return AMC_ERROR;
 		}
@@ -384,25 +469,18 @@ int amclib::amcGetSerialNumber(uint8_t cardNum, char *serialNum, size_t *bufferS
 {
 	TRACING();
 
-	// Validate card number is within valid range
-	if (cardNum >= numCards) {
-		ERR("Invalid card number {} (valid range: 0-{})\n", cardNum, numCards - 1);
-		return AMC_ERROR;
-	}
-
-	// Ensure PLDM object exists for the specified card
-	if (pldmobj[cardNum] == nullptr) {
-		ERR("PLDM object not initialized for card {}\n", cardNum);
-		return AMC_ERROR;
-	}
-
 	if (bufferSize == nullptr) {
 		ERR("Buffer size parameter cannot be null\n");
 		return AMC_ERROR;
 	}
 
+	const CardLease card = acquireCard(cardNum);
+	if (!card) {
+		return AMC_ERROR;
+	}
+
 	// Call the underlying PLDM function directly
-	if (pldmobj[cardNum]->getFruSerialNum(serialNum, *bufferSize) != PLDM_SUCCESS) {
+	if (card->getFruSerialNum(serialNum, *bufferSize) != PLDM_SUCCESS) {
 		ERR("Failed to get serial number for card {}\n", cardNum);
 		return AMC_ERROR;
 	}
@@ -433,13 +511,8 @@ int amclib::amcGetPartNumber(uint8_t cardNum, char *partNum, size_t *bufferSize)
 {
 	TRACING();
 
-	if (cardNum >= numCards) {
-		ERR("Invalid card number {} (valid range: 0-{})\n", cardNum, numCards - 1);
-		return AMC_ERROR;
-	}
-
-	if (pldmobj[cardNum] == nullptr) {
-		ERR("PLDM object not initialized for card {}\n", cardNum);
+	const CardLease card = acquireCard(cardNum);
+	if (!card) {
 		return AMC_ERROR;
 	}
 
@@ -448,7 +521,7 @@ int amclib::amcGetPartNumber(uint8_t cardNum, char *partNum, size_t *bufferSize)
 		return AMC_ERROR;
 	}
 
-	if (pldmobj[cardNum]->getFruPartNum(partNum, *bufferSize) != PLDM_SUCCESS) {
+	if (card->getFruPartNum(partNum, *bufferSize) != PLDM_SUCCESS) {
 		ERR("Failed to get part number for card {}\n", cardNum);
 		return AMC_ERROR;
 	}
@@ -483,20 +556,13 @@ int amclib::amcGetVersion(uint8_t cardNum, char *amcVersion, size_t *bufferSize)
 {
 	TRACING();
 
-	// Validate card number is within valid range
-	if (cardNum >= numCards) {
-		ERR("Invalid card number {} (valid range: 0-{})\n", cardNum, numCards - 1);
-		return AMC_ERROR;
-	}
-
-	// Ensure PLDM object exists for the specified card
-	if (pldmobj[cardNum] == nullptr) {
-		ERR("PLDM object not initialized for card {}\n", cardNum);
+	const CardLease card = acquireCard(cardNum);
+	if (!card) {
 		return AMC_ERROR;
 	}
 
 	// Call the underlying PLDM function directly
-	if (pldmobj[cardNum]->getAmcVersion(amcVersion, bufferSize) != PLDM_SUCCESS) {
+	if (card->getAmcVersion(amcVersion, bufferSize) != PLDM_SUCCESS) {
 		ERR("Failed to get version for card {}\n", cardNum);
 		return AMC_ERROR;
 	}
@@ -525,13 +591,8 @@ int amclib::amcGetTdp(uint8_t cardNum, char *tdp, size_t *bufferSize)
 {
 	TRACING();
 
-	if (cardNum >= numCards) {
-		ERR("Invalid card number {} (valid range: 0-{})\n", cardNum, numCards - 1);
-		return AMC_ERROR;
-	}
-
-	if (pldmobj[cardNum] == nullptr) {
-		ERR("PLDM object not initialized for card {}\n", cardNum);
+	const CardLease card = acquireCard(cardNum);
+	if (!card) {
 		return AMC_ERROR;
 	}
 
@@ -540,7 +601,7 @@ int amclib::amcGetTdp(uint8_t cardNum, char *tdp, size_t *bufferSize)
 		return AMC_ERROR;
 	}
 
-	if (pldmobj[cardNum]->getFruTdp(tdp, *bufferSize) != PLDM_SUCCESS) {
+	if (card->getFruTdp(tdp, *bufferSize) != PLDM_SUCCESS) {
 		DBG("TDP not available for card {}\n", cardNum);
 		return AMC_ERROR;
 	}
@@ -552,41 +613,103 @@ int amclib::amcGetTdp(uint8_t cardNum, char *tdp, size_t *bufferSize)
 	return AMC_SUCCESS;
 }
 
+// Time the card needs to complete an AMC-driven reset before the bus is worth rescanning.
+static constexpr uint32_t GPU_RESET_SETTLE_MS = 6000;
+
 /**
  * @brief Perform AMC reset via PLDM Platform Monitoring & Control
  *
- * Resets the Add-in Card Management Controller (AMC) for the specified card.
+ * Resets the Add-in Card Management Controller (AMC) for the specified card and brings
+ * the GPU back onto the PCI bus around it. The AMC powers the GPU down, so its link goes
+ * away and it stops answering config reads for the duration of the reset. The sequence is:
+ *
+ * 1. Mask Surprise Link Down on the root port above the GPU, so the deliberate
+ *    power-down is not reported as a fatal AER error.
+ * 2. Issue the PLDM reset command.
+ * 3. Remove the GPU from the bus while it is down.
+ * 4. Wait for the reset to complete.
+ * 5. Rescan the bus and confirm the GPU came back with a trained link.
+ * 6. Clear the Surprise Link Down status and unmask its reporting again.
  *
  * @param [in] cardNum Zero-based card number to reset (0 to numCards-1)
  *
  * @return Status of reset operation
- * @retval AMC_SUCCESS Reset command sent successfully
- * @retval AMC_ERROR Invalid card number or reset command failed
+ * @retval AMC_SUCCESS GPU was reset and is back on the bus
+ * @retval AMC_ERROR Invalid card number, or any step of the sequence failed
  *
  */
 int amclib::amcGpuReset(uint32_t cardNum)
 {
 	TRACING();
 
-	if (cardNum >= static_cast<uint32_t>(numCards)) {
-		ERR("Invalid card number {} (valid range: 0-{})\n", cardNum, numCards - 1);
+	const CardLease card = acquireCard(cardNum);
+	if (!card) {
 		return AMC_ERROR;
 	}
 
-	if (pldmobj[cardNum] == nullptr) {
-		ERR("PLDM object not initialized for card {}\n", cardNum);
+	const std::string gpuBdf = amcDeviceList->at(cardNum).gpuParentPath;
+	if (gpuBdf.empty()) {
+		ERR("No GPU BDF known for card {}; cannot sequence the reset\n", cardNum);
 		return AMC_ERROR;
 	}
 
-	DBG("Initiating AMC reset for card {}\n", cardNum);
+	// The root port above the GPU's switch upstream port, which is where Surprise Down has
+	// to be masked for the AMC to cut the GPU's power without raising an AER exception.
+	// Resolved up front because the lookup walks the GPU's own sysfs node, which is gone
+	// once the device has been removed.
+	const std::string portBdf = getParentOfUpstreamPortBdf(gpuBdf);
+	if (portBdf.empty()) {
+		ERR("Could not find the root port above GPU {}\n", gpuBdf);
+		return AMC_ERROR;
+	}
+
+	DBG("Initiating AMC reset for card {} (GPU {}, root port {})\n", cardNum, gpuBdf, portBdf);
+
+	bool sldWasAlreadyMasked = false;
+	if (maskSLDInPCIeConfig(portBdf, &sldWasAlreadyMasked) != 0) {
+		ERR("Failed to mask Surprise Link Down on {} before resetting GPU {}\n", portBdf, gpuBdf);
+		return AMC_ERROR;
+	}
+
+	int ret = AMC_SUCCESS;
 
 	// Execute the AMC reset command
-	if (pldmobj[cardNum]->amcGpuReset() != PLDM_SUCCESS) {
+	if (card->amcGpuReset() != PLDM_SUCCESS) {
 		ERR("Failed to reset AMC for card {}\n", cardNum);
-		return AMC_ERROR;
+		ret = AMC_ERROR;
 	}
 
-	return AMC_SUCCESS;
+	// Hand back the AMC I2C handle before the GPU is detached. The I2C adapter is provided by
+	// the GPU, so it disappears along with it, and the reset command above is the last thing
+	// this card's PLDM object can do until the card is enumerated again.
+	if (ret == AMC_SUCCESS && !pldmobj[cardNum]->closeAmcInterface()) {
+		ERR("Failed to close the AMC I2C handle for card {} before removing GPU {}\n", cardNum, gpuBdf);
+		ret = AMC_ERROR;
+	}
+
+	if (ret == AMC_SUCCESS && removePCIeDevice(gpuBdf) != 0) {
+		ERR("Failed to remove GPU {} from the PCI bus\n", gpuBdf);
+		ret = AMC_ERROR;
+	}
+
+	if (ret == AMC_SUCCESS) {
+		MSLEEP(GPU_RESET_SETTLE_MS);
+
+		if (rescanPCIeDevice(gpuBdf, "") != 0) {
+			ERR("GPU {} did not come back after the AMC reset of card {}\n", gpuBdf, cardNum);
+			ret = AMC_ERROR;
+		}
+	}
+
+	// Restore the port's error reporting even when a step above failed, so a failed reset
+	// does not leave Surprise Link Down masked for good. Ports that already had it masked
+	// keep it that way, since that setting is not ours to drop.
+	if (unmaskSLDInPCIeConfig(portBdf, sldWasAlreadyMasked) != 0) {
+		ERR("Failed to unmask Surprise Link Down on {} after resetting GPU {}\n", portBdf, gpuBdf);
+		ret = AMC_ERROR;
+	}
+
+	return ret;
 }
 
 /**
@@ -610,16 +733,15 @@ int amclib::amcReadFile(int deviceIndex, uint16_t filePdrId, std::vector<uint8_t
 {
 	TRACING();
 
-	if (deviceIndex < 0 || deviceIndex >= numCards) {
-		ERR("Invalid device index {} (valid range: 0-{})\n", deviceIndex, numCards - 1);
+	if (deviceIndex < 0) {
+		ERR("Invalid device index: {}\n", deviceIndex);
+		return AMC_ERROR;
+	}
+	const CardLease card = acquireCard(static_cast<uint32_t>(deviceIndex));
+	if (!card) {
 		return AMC_ERROR;
 	}
 
-	if (!pldmobj || !pldmobj[deviceIndex]) {
-		ERR("PLDM object not initialized for device index: {}\n", deviceIndex);
-		return AMC_ERROR;
-	}
-
-	int ret = pldmobj[deviceIndex]->getFile(filePdrId, fileData);
+	int ret = card->getFile(filePdrId, fileData);
 	return (ret == PLDM_SUCCESS) ? AMC_SUCCESS : AMC_ERROR;
 }

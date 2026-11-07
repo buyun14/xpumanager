@@ -135,6 +135,10 @@
                                     "description": "Sampling interval for the high-frequency metrics.",
                                     "type": "string"
                                 },
+                                "subsystems": {
+                                    "description": "Configuration for enabling/disabling metric subsystems, all enabled by default, see the `intel_xpu` README for details.",
+                                    "type": "object"
+                                },
                                 "timeout": {
                                     "description": "Metrics collection timeout.",
                                     "type": "integer"
@@ -270,6 +274,11 @@
             "$ref": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/master/v1.34.2/_definitions.json#/definitions/io.k8s.api.core.v1.PodSpec/properties/initContainers",
             "type": "array"
         },
+        "livenessProbe": {
+            "description": "[Liveness probe](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/) of the xpumd container. NOTE: requires the `health_check` extension to be enabled in `config.service.extensions`",
+            "$ref": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/master/v1.34.2/_definitions.json#/definitions/io.k8s.api.core.v1.Probe",
+            "type": "object"
+        },
         "nameOverride": {
             "description": "Override the chart name",
             "type": "string"
@@ -302,6 +311,11 @@
                 }
             },
             "additionalProperties": false
+        },
+        "readinessProbe": {
+            "description": "[Readiness probe](https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/) of the xpumd container. NOTE: requires the `health_check` extension to be enabled in `config.service.extensions`",
+            "$ref": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/master/v1.34.2/_definitions.json#/definitions/io.k8s.api.core.v1.Probe",
+            "type": "object"
         },
         "resourcesOverride": {
             "description": "[Resource requests and limits](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/) of the container. NOTE: overrides `gpuAccess` setting",

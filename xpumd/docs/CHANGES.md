@@ -13,6 +13,57 @@ Contents:
     * [XPUM 1.x](#xpum-1x)
 
 
+## XPUM 2.x.x
+
+* Breaking changes (for the XPUMD config):
+  * `intel_crashlog` receiver `glob` option replaced by `globs` list, to support multiple filename patterns
+    * **Action required:** if custom config is used, the `glob: "<pattern>"` needs to be updated to `globs: ["<pattern>"]`
+  * `intel_xpu_status` processor support for defaults which have lower thresholds than more specific thresholds,
+    by stopping conditions processing at first value with a matching parent filter
+    * **Action required:** specify states' default threshold values as the last condition
+* Breaking changes (for the `intel_xpu_info` exporter gRPC API):
+  * Proto package renamed from `deviceinfo` to `deviceinfo.v1alpha2`
+  * `SeverityLevel` enum values of `SEVERITY_LEVEL_OK` and `SEVERITY_LEVEL_UNKNOWN` swapped (`OK=0`, `UNKNOWN=1`), so that the numeric value increases with severity
+  * **Action required:** gRPC clients need to be regenerated from the updated `deviceinfo.proto`
+* Metric workarounds:
+  * Report also disabled power limits (part of [#184](https://github.com/intel/xpumanager/issues/184) fix)
+  * SR-IOV virtual functions are skipped, as they provide duplicate or bogus metrics of their PF
+  * OEM serial ID is used as `hw.gpu.info` serial number fallback (like `xpu-smi` does)
+* Metric updates:
+  * Fan metrics support
+  * Log output includes all relevant metric (differentiation) attributes
+  * New internal telemetry metrics: `otelcol_sysman_sampler_missed_deadlines`,
+    `otelcol_sysman_sampler_interval_usage` and `otelcol_crashlogs_dropped`
+* Metric output fixes:
+  * `intel_xpu_info` exporter reported an empty subdevice ID, and aggregated
+    memory modules of the same type on different subdevices
+  * `intel_xpu_info` exporter event `message` was empty for non-string log record bodies
+  * `intel_xpu_status` processor and `intel_xpu_info` exporter attribute filters did not match non-string attributes
+* Config updates:
+  * `intel_xpu` receiver:
+    * `subsystems` option, to disable scraping of whole metric subsystems
+  * `intel_crashlog` receiver:
+    * `min_file_size` (default 1 byte, i.e. skip empty files) and `max_file_size` (default 1 MiB) options
+  * `intel_xpu_status` processor:
+    * Metrics aggregation (`aggregate`) support for rules
+    * `operator` (`In` / `NotIn`) support for attribute filters
+  * `intel_xpu_info` exporter:
+    * `operator` (`In` / `NotIn`) support for attribute filters
+* New extensions included:
+  * `health_check` extension, enabled by default in the example config and in the Helm chart,
+     for checking the collector status over HTTP (port 13133)
+  * `basicauth` and `bearertokenauth` extensions for authenticating the OTLP exporters and the Prometheus exporter endpoint
+* Helm chart:
+  * Readiness probe for the xpumd container (`readinessProbe`), using the `health_check` extension
+  * Liveness probe (`livenessProbe`), disabled by default
+  * `intel_xpu_status` temperature and power warning threshold rules synced with `xpu-smi`
+    (also in the example config), including new `critical` states for the core and memory
+    temperatures (memory temperature `warning` state replaced by `critical` one)
+* XPUMD binary reports the actual XPUMD version (instead of `0.0.0`)
+* XPUMD image: OS packages are from Ubuntu 24.04 instead of Debian (matching the driver stack packages), base image digests pinned
+* Go dependencies: OTel collector update to v0.163.0 + other version updates
+
+
 ## XPUM 2.3.0
 
 * Breaking changes (for the XPUMD metrics):
@@ -20,9 +71,6 @@ Contents:
     * **Action required:** `hw_status{hw_type="gpu",hw_state="ecc_<state>"}` queries need to be updated to `hw_gpu_ecc_state{hw_state="<state>"}`
   * `hw.memory.ecc` attribute of the `hw.gpu.info` metric renamed to `hw.gpu.ecc.support` (to match the new ECC state metric)
     * **Action required:** `hw_gpu_info{hw_memory_ecc=...}` queries need to be updated to `hw_gpu_info{hw_gpu_ecc_support=...}`
-* Breaking changes (for the XPUMD config):
-  * `intel_crashlog` receiver `glob` option replaced by `globs` list, to support multiple filename patterns
-    * **Action required:** if custom config is used, the `glob: "<pattern>"` needs to be updated to `globs: ["<pattern>"]`
 * XPUMD metrics:
   * New `ok` state for the GPU device in the `hw.status` metric
     * `hw_status{hw_type="gpu",hw_state="ok"}` aggregates the device level GPU states

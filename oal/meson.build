@@ -9,15 +9,23 @@ oal_deps = [thread_dep, levelzero_dep, bdf_dep, igsc_dep, compat_dep]
 
 if is_windows
   oal_sources = files(
+    'progress.cpp',
     'win/dllmain.cpp',
     'win/dynload.cpp',
     'win/fs_lock.cpp',
     'win/http_client.cpp',
     'win/i2c_interface.cpp',
+    'win/kernel_driver.cpp',
+    'win/pci_link.cpp',
+    'win/privilege.cpp',
+    'win/process_exit.cpp',
+    'win/module_info.cpp',
     'win/path_lookup_win.cpp',
     'win/proc_fdinfo.cpp',
     'win/process_platform.cpp',
+    'win/serial_cache.cpp',
     'win/terminal.cpp',
+    'win/watchdog_os.cpp',
     'win/thread.cpp',
     'win/win.cpp',
   )
@@ -25,6 +33,7 @@ if is_windows
   oal_deps += windows_deps
 elif is_linux
   oal_sources = files(
+    'progress.cpp',
     'lin/crashlog_lin.cpp',
     'lin/dynload.cpp',
     'lin/crashlog_lin_exec.cpp',
@@ -36,15 +45,20 @@ elif is_linux
     'lin/kernel_driver.cpp',
     'lin/lin.cpp',
     'lin/linvf.cpp',
+    'lin/module_info.cpp',
     'lin/path_lookup.cpp',
     'lin/pci_database.cpp',
     'lin/pci_sysfs.cpp',
+    'lin/privilege.cpp',
     'lin/proc_fdinfo.cpp',
+    'lin/process_exit.cpp',
     'lin/process_platform.cpp',
+    'lin/serial_cache.cpp',
     'lin/terminal.cpp',
     'lin/topology.cpp',
     'lin/pch_prod_state.cpp',
     'lin/vram_debugfs.cpp',
+    'lin/watchdog_os.cpp',
   )
   oal_inc_dirs += [include_directories('lin')]
   oal_deps += [cpp.find_library('dl', required: false)]

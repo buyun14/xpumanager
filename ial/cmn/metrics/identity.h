@@ -28,6 +28,25 @@
 
 namespace metrics::identity {
 
+/**
+ * @brief Says what the reset reasons the driver reports call for.
+ *
+ * @param[in] reasons Reset reason flags from the device state.
+ *
+ * @return "None" when no reset is needed, "Reset to repair" when a repair is waiting on one,
+ *         and "Reset" for any other reason, such as a wedged device.
+ */
+[[nodiscard]] inline std::string_view recoveryActionOf(zes_reset_reason_flags_t reasons) noexcept
+{
+	if (reasons == 0) {
+		return "None";
+	}
+	if ((reasons & ZES_RESET_REASON_FLAG_REPAIR) != 0U) {
+		return "Reset to repair";
+	}
+	return "Reset";
+}
+
 /** Width of a BDF address rendered as "dddd:bb:dd.f" (see pci::getBDFStr). */
 inline constexpr int BDF_DISPLAY_WIDTH = sizeof("0000:00:00.0") - 1;
 
@@ -114,13 +133,17 @@ inline std::span<const QueryMetric> getIdentityMetrics() noexcept
 				"The serial number physically printed on the board. A globally unique immutable alphanumeric value.",
 			.source = MetricSource::Static,
 			.groups = MetricGroup::IDENTITY,
+			.readsFirmware = true,
 			.getter = [](devInfo &d, MetricValue &out, const MetricCache &cache) -> ze_result_t {
-				if (!cache.serialNumber) {
+				constexpr auto unknownRetryInterval = std::chrono::seconds{10};
+				const auto now = std::chrono::steady_clock::now();
+				if (!cache.serialNumber || (*cache.serialNumber == UNKNOWN_SERIAL && now >= cache.serialRetryAt)) {
 					std::string serial;
 					auto const r = querySerialNumber(d, serial);
 					if (r != ZE_RESULT_SUCCESS) {
 						return r;
 					}
+					cache.serialRetryAt = now + unknownRetryInterval;
 					cache.serialNumber = std::move(serial);
 				}
 				out = *cache.serialNumber;
@@ -171,6 +194,7 @@ inline std::span<const QueryMetric> getIdentityMetrics() noexcept
 			.description = "The version of the GFX firmware currently running on the GPU board.",
 			.source = MetricSource::Static,
 			.groups = MetricGroup::IDENTITY,
+			.readsFirmware = true,
 			.getter = [](devInfo &d, MetricValue &out, const MetricCache &) -> ze_result_t {
 				auto *fw = d.dev->getFirmware();
 				if (fw == nullptr) {
@@ -179,6 +203,12 @@ inline std::span<const QueryMetric> getIdentityMetrics() noexcept
 				auto *p = d.dev->getPCI();
 				if (p == nullptr) {
 					return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+				}
+				// The direct GSC read is one request; the fallback enumerates every firmware
+				// component and costs over a second per device as root on some platforms.
+				if (auto direct = p->getGfxFwVersion()) {
+					out = std::move(*direct);
+					return ZE_RESULT_SUCCESS;
 				}
 				std::array<char, 256> ver{};
 				auto const r = fw->getFWversion(fwType::GFX, p->getBDFStr().c_str(), ver.data(),
@@ -220,6 +250,64 @@ inline std::span<const QueryMetric> getIdentityMetrics() noexcept
 					out = xpum::compat::format("0x{:04X}", props.deviceId);
 				}
 				return r;
+			},
+		},
+		{
+			.name = "ip_version",
+			.unit = "",
+			.description = "Graphics IP version, in hex (ze_device_ip_version_ext_t): identifies the architecture "
+						   "and stepping; newer devices have higher values",
+			.source = MetricSource::Static,
+			.groups = MetricGroup::IDENTITY,
+			.getter = [](devInfo &d, MetricValue &out, const MetricCache &) -> ze_result_t {
+				ze_device_ip_version_ext_t ip{};
+				ip.stype = ZE_STRUCTURE_TYPE_DEVICE_IP_VERSION_EXT;
+				ze_device_properties_t props{};
+				props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+				props.pNext = &ip;
+				if (auto const r = d.dev->getDevProps(d.deviceHdl, &props); r != ZE_RESULT_SUCCESS) {
+					return r;
+				}
+				// A runtime without the extension leaves the version at 0.
+				if (ip.ipVersion == 0) {
+					return ZE_RESULT_ERROR_NOT_AVAILABLE;
+				}
+				out = xpum::compat::format("0x{:08X}", ip.ipVersion);
+				return ZE_RESULT_SUCCESS;
+			},
+		},
+		{
+			.name = "vf.enabled",
+			.unit = "",
+			.description = "SR-IOV virtual functions enabled on the physical function",
+			.source = MetricSource::Live,
+			.groups = MetricGroup::IDENTITY,
+			.getter = [](devInfo &d, MetricValue &out, const MetricCache &) -> ze_result_t {
+				auto *v = d.dev->getVF();
+				if (v == nullptr || d.zesDeviceHdl == nullptr) {
+					return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+				}
+				uint32_t count = 0;
+				if (auto const r = v->countEnabledVFs(d.zesDeviceHdl, count); r != ZE_RESULT_SUCCESS) {
+					return r;
+				}
+				out = xpum::compat::format("{}", count);
+				return ZE_RESULT_SUCCESS;
+			},
+		},
+		{
+			.name = "recovery_action",
+			.unit = "",
+			.description = "What the device needs to keep working: None, Reset, or Reset to repair",
+			.source = MetricSource::Live,
+			.groups = MetricGroup::IDENTITY,
+			.getter = [](devInfo &d, MetricValue &out, const MetricCache &) -> ze_result_t {
+				zes_reset_reason_flags_t reasons = 0;
+				if (auto const r = d.dev->getResetReasons(reasons); r != ZE_RESULT_SUCCESS) {
+					return r;
+				}
+				out = std::string{recoveryActionOf(reasons)};
+				return ZE_RESULT_SUCCESS;
 			},
 		},
 		{

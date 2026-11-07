@@ -6,6 +6,7 @@
 ial_cmn_sources = files(
   '../../hal/core/debug.cpp',
   'metrics/clock.cpp',
+  'metrics/mode.cpp',
   'metrics/temperature_metrics.cpp',
   'metrics/utilization.cpp',
   'metrics/pci.cpp',
@@ -21,15 +22,18 @@ ial_cmn_sources = files(
   'cmd_listpciinfo.cpp',
   'cmd_log.cpp',
   'cmd_ps.cpp',
+  'cmd_query.cpp',
   'cmd_smi.cpp',
   'cmd_stats.cpp',
   'cmd_topology.cpp',
   'cmd_updatefw.cpp',
   'cmd_vgpu.cpp',
   'cmds.cpp',
+  'frame_loop.cpp',
   'metrics_registry.cpp',
   'oem_serial.cpp',
   'printer.cpp',
+  'version_report.cpp',
   'metrics/eu_array.cpp',
   'metrics/fan.cpp',
   'metrics/memory.cpp',
@@ -41,6 +45,7 @@ ial_cmn_inc = include_directories('.')
 ial_cmn_deps = [
   libxpum_dep,
   oal_dep,
+  build_info_dep,
   nlohmann_json_dep,
   cli11_dep,
   amc_dep,
@@ -48,6 +53,7 @@ ial_cmn_deps = [
   table_dep,
   bdf_dep,
   compat_dep,
+  watchdog_dep,
 ]
 if is_linux
   ial_cmn_deps += [pciaccess_dep]

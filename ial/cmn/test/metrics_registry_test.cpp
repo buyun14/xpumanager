@@ -11,6 +11,7 @@
 #undef INFO
 #endif
 
+#include "cmds.h"
 #include "metrics_registry.h"
 #include "metrics/temperature_metrics.h"
 #include "metrics/utilization.h"
@@ -20,10 +21,12 @@
 #include "metrics/fan.h"
 #include "metrics/identity.h"
 #include "metrics/memory.h"
+#include "metrics/mode.h"
 #include "metrics/pci.h"
 #include "metrics/power.h"
 #include "ze_api.h"
 #include "zes_api.h"
+#include <bit>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -52,7 +55,6 @@ TEST_CASE("parseGroupMask parses single-letter aliases")
 	CHECK(hasGroup(parseGroupMask("m"), MetricGroup::MEMORY));
 	CHECK(hasGroup(parseGroupMask("u"), MetricGroup::UTILIZATION));
 	CHECK(hasGroup(parseGroupMask("c"), MetricGroup::CLOCK));
-	CHECK(hasGroup(parseGroupMask("e"), MetricGroup::ECC));
 	CHECK(hasGroup(parseGroupMask("f"), MetricGroup::FAN));
 	CHECK(hasGroup(parseGroupMask("t"), MetricGroup::PCI));
 	CHECK(hasGroup(parseGroupMask("x"), MetricGroup::EU_ARRAY));
@@ -83,7 +85,6 @@ TEST_CASE("parseGroupMask expands multi-character alias shorthands")
 	CHECK(hasGroup(mask, MetricGroup::UTILIZATION));
 	// Groups not named by 'p' or 'u' must be absent.
 	CHECK_FALSE(hasGroup(mask, MetricGroup::CLOCK));
-	CHECK_FALSE(hasGroup(mask, MetricGroup::ECC));
 	CHECK_FALSE(hasGroup(mask, MetricGroup::FAN));
 	CHECK_FALSE(hasGroup(mask, MetricGroup::MEMORY));
 	CHECK_FALSE(hasGroup(mask, MetricGroup::PCI));
@@ -123,16 +124,25 @@ TEST_CASE("every advertised section name is accepted by parseGroupMask")
 	}
 }
 
-TEST_CASE("XPUM-1480: COMPUTE and PIDS are not display sections")
+TEST_CASE("XPUM-1480: PIDS is not a display section")
 {
-	// Both were advertised by the top-level --display help text but never existed in
-	// GROUP_TABLE, so --display=COMPUTE / --display=PIDS failed. If either is ever
-	// implemented as a real section, it must appear in sectionNames() too.
-	for (const std::string_view bogus : std::to_array<std::string_view>({"COMPUTE", "PIDS"})) {
+	// It was advertised by the top-level --display help text but never existed in GROUP_TABLE,
+	// so --display=PIDS failed. The query command accepts it as a section of its own, but the
+	// registry still has no process fields; if it is ever implemented as a real section, it must
+	// appear in sectionNames() too. COMPUTE was in the same position until scheduler.mode gave it
+	// a field, and it now round-trips like every other advertised section.
+	for (const std::string_view bogus : std::to_array<std::string_view>({"PIDS"})) {
 		CHECK_MESSAGE(parseGroupMask(bogus) == MetricGroup::NONE, bogus, " unexpectedly parses as a group");
 		CHECK_MESSAGE(std::ranges::find(sectionNames(), bogus) == sectionNames().end(), bogus,
 					  " is advertised but parseGroupMask rejects it");
 	}
+}
+
+TEST_CASE("XPUM-1480: COMPUTE is a display section because a field implements it")
+{
+	CHECK(std::ranges::find(sectionNames(), std::string_view{"COMPUTE"}) != sectionNames().end());
+	CHECK(hasGroup(parseGroupMask("COMPUTE"), MetricGroup::COMPUTE));
+	CHECK_FALSE(getMetricsByGroup(MetricGroup::COMPUTE).empty());
 }
 
 TEST_CASE("XPUM-1480: --display resolves individual field names, as its help text claims")
@@ -284,9 +294,16 @@ TEST_CASE("findMetric resolves identity metric names")
 	CHECK(findMetric("pci.sub_device_id").has_value());
 }
 
-TEST_CASE("IDENTITY group size matches getIdentityMetrics")
+TEST_CASE("IDENTITY group contains every getIdentityMetrics entry")
 {
-	CHECK(getMetricsByGroup(MetricGroup::IDENTITY).size() == metrics::identity::getIdentityMetrics().size());
+	// Other files may add identity-section fields of their own (health.status), so the group can
+	// be larger than the identity file but must never miss one of its entries.
+	const auto byIdentity = getMetricsByGroup(MetricGroup::IDENTITY);
+	for (const auto &field : metrics::identity::getIdentityMetrics()) {
+		CHECK_MESSAGE(std::ranges::any_of(byIdentity, [&field](const auto *m) { return m->name == field.name; }),
+					  field.name, " missing from the IDENTITY group");
+	}
+	CHECK(byIdentity.size() >= metrics::identity::getIdentityMetrics().size());
 }
 
 TEST_CASE("findMetric resolves PCI metric names")
@@ -313,6 +330,56 @@ TEST_CASE("PCI group contains all pci.cpp metrics plus identity metrics tagged P
 		CHECK_MESSAGE(std::ranges::any_of(byPci, [name](const auto *m) { return m->name == name; }), name,
 					  " missing from PCI group");
 	}
+}
+
+#ifdef __linux__
+// fdinfo exists on Linux only: the Windows stubs of snapshotsFor() and aggregateDeviceUtil()
+// report nothing, so these expectations hold on Linux alone.
+
+// One process on the fixture's device whose ccs engine was busy @p busy of @p total cycles.
+static fdinfo::DeviceSnapshots sharedSnapshot(const std::string &pci, uint64_t wallNs, uint64_t busy, uint64_t total)
+{
+	fdinfo::ProcessSnapshot snap;
+	snap.pid = 4242;
+	snap.wallNs = wallNs;
+	snap.engines["ccs"] = fdinfo::EngineCounters{.cycles = busy, .totalCycles = total, .capacity = 0};
+	return fdinfo::DeviceSnapshots{{pci, {snap}}};
+}
+
+TEST_CASE_FIXTURE(ZeroDeviceFixture, "populateMetricCacheBegin/End take fdinfo from the shared snapshots")
+{
+	const std::string pci = devPciAddr(di);
+	const auto before = sharedSnapshot(pci, 1'000, 100, 1'000);
+	const auto after = sharedSnapshot(pci, 2'000, 600, 2'000);
+
+	auto cache = populateMetricCacheBegin(di, MetricInput::FDINFO, &before);
+	REQUIRE(cache.fdinfoSnap.size() == 1);
+	CHECK(cache.fdinfoSnap[0].pid == 4242);
+
+	populateMetricCacheEnd(di, cache, &after);
+	REQUIRE(cache.fdinfoCompute.has_value());
+	CHECK(*cache.fdinfoCompute == doctest::Approx(50.0F)); // 500 of 1000 cycles
+	CHECK(cache.fdinfoSnap[0].engines.at("ccs").cycles == 600);
+}
+
+TEST_CASE_FIXTURE(ZeroDeviceFixture, "populateMetricCacheContinuous takes the new end from the shared snapshot")
+{
+	const std::string pci = devPciAddr(di);
+	const auto first = sharedSnapshot(pci, 1'000, 0, 1'000);
+	const auto second = sharedSnapshot(pci, 2'000, 250, 2'000);
+
+	auto prev = populateMetricCacheBegin(di, MetricInput::FDINFO, &first);
+	populateMetricCacheEnd(di, prev, &first);
+	const auto next = populateMetricCacheContinuous(di, prev, MetricInput::FDINFO, &second);
+	REQUIRE(next.fdinfoCompute.has_value());
+	CHECK(*next.fdinfoCompute == doctest::Approx(25.0F)); // 250 of 1000 cycles
+}
+#endif
+
+TEST_CASE("captureFdinfo walks /proc only for fields that read fdinfo")
+{
+	CHECK(captureFdinfo(MetricInput::POWER | MetricInput::ENGINE).empty());
+	CHECK(captureFdinfo(MetricInput::NONE).empty());
 }
 
 TEST_CASE_FIXTURE(ZeroDeviceFixture, "pci.sub_device_id getter: UNSUPPORTED when the device has no PCI address")
@@ -361,6 +428,8 @@ TEST_CASE("getMetricsByGroup UTILIZATION returns only canonical names, no aliase
 		std::string_view{"utilization.compute"},
 		std::string_view{"utilization.render"},
 		std::string_view{"utilization.media"},
+		std::string_view{"utilization.video"},
+		std::string_view{"utilization.video_enhancement"},
 		std::string_view{"utilization.copy"},
 		std::string_view{"utilization.memory"},
 		std::string_view{"eu.active"},
@@ -374,12 +443,15 @@ TEST_CASE("getMetricsByGroup UTILIZATION returns only canonical names, no aliase
 	}
 }
 
-TEST_CASE("MEMORY group contains utilization.memory first, then all memory.cpp metrics")
+TEST_CASE("MEMORY group contains utilization.memory first, then the memory.cpp metrics that belong to it")
 {
 	const auto byMem = getMetricsByGroup(MetricGroup::MEMORY);
 	REQUIRE_FALSE(byMem.empty());
 	CHECK(byMem[0]->name == "utilization.memory"); // registered before memory.cpp metrics
-	CHECK(byMem.size() == metrics::memory::getMemoryMetrics().size() + 1);
+	const auto memoryEntries = metrics::memory::getMemoryMetrics();
+	const auto inMemoryGroup = std::ranges::count_if(
+		memoryEntries, [](const QueryMetric &m) { return hasGroup(m.groups, MetricGroup::MEMORY); });
+	CHECK(byMem.size() == static_cast<std::size_t>(inMemoryGroup) + 1);
 }
 
 TEST_CASE("findMetric resolves Temperature metric names")
@@ -418,7 +490,10 @@ TEST_CASE("findMetric resolves clock aliases")
 TEST_CASE("clock aliases do not appear as separate entries in group expansion")
 {
 	const auto byClock = getMetricsByGroup(MetricGroup::CLOCK);
-	CHECK(byClock.size() == metrics::clock::getClockMetrics().size());
+	const auto clockEntries = metrics::clock::getClockMetrics();
+	CHECK(byClock.size() == static_cast<std::size_t>(std::ranges::count_if(clockEntries, [](const QueryMetric &m) {
+			  return hasGroup(m.groups, MetricGroup::CLOCK);
+		  })));
 	// Aliases (sm/video/max.sm/max.video) resolve to canonical entries; they must not produce duplicate rows.
 	const auto present = [&](std::string_view n) {
 		return std::ranges::any_of(byClock, [n](const auto *m) { return m->name == n; });
@@ -488,26 +563,46 @@ TEST_CASE("findMetric resolves Memory metric names")
 	CHECK(findMetric("memory.bandwidth.utilization").has_value());
 }
 
-TEST_CASE("findMetric resolves ECC metric names")
+namespace {
+
+/** @brief An ECC field by name; they are kept out of the registry, so findMetric cannot reach them */
+const QueryMetric &eccMetric(std::string_view name)
 {
-	CHECK(findMetric("ecc.mode.current").has_value());
-	CHECK(findMetric("ecc.errors.corrected.aggregate.total").has_value());
-	CHECK(findMetric("ecc.errors.uncorrected.aggregate.total").has_value());
-	CHECK(findMetric("ecc.errors.aggregate.total").has_value());
-	CHECK(findMetric("ras.reset").has_value());
-	CHECK(findMetric("ras.programming.errors").has_value());
-	CHECK(findMetric("ras.driver.errors").has_value());
-	CHECK(findMetric("ras.cache.errors.correctable").has_value());
-	CHECK(findMetric("ras.cache.errors.uncorrectable").has_value());
-	CHECK(findMetric("ras.non_compute.errors.correctable").has_value());
-	CHECK(findMetric("ras.non_compute.errors.uncorrectable").has_value());
-	CHECK(findMetric("ras.non_compute.errors.total").has_value());
+	const auto fields = metrics::ecc::getEccMetrics();
+	const auto it = std::ranges::find(fields, name, &QueryMetric::name);
+	REQUIRE_MESSAGE(it != fields.end(), name);
+	return *it;
 }
 
-TEST_CASE("ECC group size matches getEccMetrics")
+} // namespace
+
+TEST_CASE("no ECC or RAS field can be selected")
 {
-	const auto byEcc = getMetricsByGroup(MetricGroup::ECC);
-	CHECK(byEcc.size() == metrics::ecc::getEccMetrics().size());
+	CHECK(getMetricsByGroup(MetricGroup::ECC).empty());
+	CHECK(parseGroupMask("ECC") == MetricGroup::NONE);
+	CHECK(parseGroupMask("e") == MetricGroup::NONE);
+	CHECK(std::ranges::find(sectionNames(), "ECC") == sectionNames().end());
+	for (const auto &field : metrics::ecc::getEccMetrics()) {
+		CAPTURE(field.name);
+		CHECK_FALSE(findMetric(field.name).has_value());
+		CHECK(resolveQuery(field.name).empty());
+	}
+	CHECK(resolveQuery("ras.*").empty());
+	CHECK(resolveQuery("ecc.*").empty());
+	for (const auto *field : resolveQuery("ALL")) {
+		CHECK_MESSAGE(!hasGroup(field->groups, MetricGroup::ECC), field->name);
+	}
+}
+
+TEST_CASE("the ECC fields are still defined")
+{
+	for (const auto name : std::to_array<std::string_view>(
+			 {"ecc.mode.current", "ecc.errors.corrected.aggregate.total", "ecc.errors.uncorrected.aggregate.total",
+			  "ecc.errors.aggregate.total", "ras.reset", "ras.programming.errors", "ras.driver.errors",
+			  "ras.cache.errors.correctable", "ras.cache.errors.uncorrectable", "ras.non_compute.errors.correctable",
+			  "ras.non_compute.errors.uncorrectable", "ras.non_compute.errors.total"})) {
+		CHECK(eccMetric(name).groups == MetricGroup::ECC);
+	}
 }
 
 TEST_CASE_FIXTURE(ZeroDeviceFixture,
@@ -522,7 +617,7 @@ TEST_CASE_FIXTURE(ZeroDeviceFixture,
 			  "ras.non_compute.errors.uncorrectable", "ras.non_compute.errors.total"})) {
 		CAPTURE(name);
 		MetricValue out;
-		CHECK(findMetric(name).value().getter(di, out, c) == ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+		CHECK(eccMetric(name).getter(di, out, c) == ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
 		CHECK(out.empty());
 	}
 }
@@ -593,6 +688,39 @@ TEST_CASE("sumRasErrors: a reported category with no errors sums to 0, not nullo
 	CHECK(sumRasErrors(states, RasTypes::CORRECTABLE, isHardwareRasCategory) == uint64_t{0});
 }
 
+TEST_CASE_FIXTURE(ZeroDeviceFixture, "throttle fields reuse the reasons already read for the sample")
+{
+	MetricCache c;
+	c.throttleRead = ThrottleRead{ZE_RESULT_SUCCESS, ZES_FREQ_THROTTLE_REASON_FLAG_THERMAL_LIMIT};
+	MetricValue out;
+	REQUIRE(findMetric("clocks.event_reasons.thermal_limit").value().getter(di, out, c) == ZE_RESULT_SUCCESS);
+	CHECK(out == "Active");
+	REQUIRE(findMetric("clocks.event_reasons.average_power_cap").value().getter(di, out, c) == ZE_RESULT_SUCCESS);
+	CHECK(out == "Not Active");
+	REQUIRE(findMetric("clocks.throttle.reason").value().getter(di, out, c) == ZE_RESULT_SUCCESS);
+	CHECK(out == "Thermal");
+
+	c.throttleRead = ThrottleRead{ZE_RESULT_ERROR_NOT_AVAILABLE, 0};
+	CHECK(findMetric("clocks.event_reasons.thermal_limit").value().getter(di, out, c) == ZE_RESULT_ERROR_NOT_AVAILABLE);
+}
+
+TEST_CASE_FIXTURE(ZeroDeviceFixture, "ECC fields reuse the RAS states already read for the sample")
+{
+	MetricCache c;
+	c.rasRead = RasRead{ZE_RESULT_SUCCESS,
+						{{ZES_RAS_ERROR_TYPE_CORRECTABLE, {{ZES_RAS_ERROR_CATEGORY_EXP_CACHE_ERRORS, 2, 0}}},
+						 {ZES_RAS_ERROR_TYPE_UNCORRECTABLE, {{ZES_RAS_ERROR_CATEGORY_EXP_CACHE_ERRORS, 3, 0}}}}};
+	// The device has no RAS HAL, so a value can only come from the states in the cache.
+	MetricValue out;
+	REQUIRE(eccMetric("ecc.errors.aggregate.total").getter(di, out, c) == ZE_RESULT_SUCCESS);
+	CHECK(out == "5");
+	REQUIRE(eccMetric("ras.cache.errors.uncorrectable").getter(di, out, c) == ZE_RESULT_SUCCESS);
+	CHECK(out == "3");
+
+	c.rasRead = RasRead{ZE_RESULT_ERROR_NOT_AVAILABLE, {}};
+	CHECK(eccMetric("ras.reset").getter(di, out, c) == ZE_RESULT_ERROR_NOT_AVAILABLE);
+}
+
 TEST_CASE("eccModeName: the Sysman state wins over the device ECC flag")
 {
 	CHECK(eccModeName(ZES_DEVICE_ECC_STATE_ENABLED, false) == "Enabled");
@@ -621,6 +749,33 @@ TEST_CASE_FIXTURE(ZeroDeviceFixture, "memory.bandwidth.utilization getter: round
 	CHECK(out == "0.07");
 }
 
+TEST_CASE_FIXTURE(ZeroDeviceFixture, "memory bandwidth getters: report N/A when counters reset backwards")
+{
+	constexpr uint64_t initialBytes = 1024;
+	constexpr uint64_t startUs = 1000;
+	constexpr uint64_t endUs = 2000;
+	constexpr uint64_t peakBw = 1048576;
+	MetricValue out;
+	MetricCache c;
+	c.memAvail = true;
+	c.memBefore = {.read = initialBytes, .write = initialBytes, .ts = startUs};
+	c.memAfter = {.read = 0, .write = 0, .ts = endUs};
+	c.memMaxBandwidth = peakBw;
+
+	const auto rd = findMetric("memory.read.bandwidth");
+	const auto wr = findMetric("memory.write.bandwidth");
+	const auto util = findMetric("memory.bandwidth.utilization");
+	REQUIRE(rd.has_value());
+	REQUIRE(wr.has_value());
+	REQUIRE(util.has_value());
+	CHECK(rd->getter(di, out, c) == ZE_RESULT_SUCCESS);
+	CHECK(out == "N/A");
+	CHECK(wr->getter(di, out, c) == ZE_RESULT_SUCCESS);
+	CHECK(out == "N/A");
+	CHECK(util->getter(di, out, c) == ZE_RESULT_SUCCESS);
+	CHECK(out == "N/A");
+}
+
 TEST_CASE("no metric is tagged with mutually exclusive groups simultaneously")
 {
 	// These pairs must never co-occur on a single metric — a cross-tag would cause
@@ -633,8 +788,6 @@ TEST_CASE("no metric is tagged with mutually exclusive groups simultaneously")
 	};
 	for (const auto [a, b, desc] : std::to_array<ExclusivePair>({
 			 {MetricGroup::POWER, MetricGroup::TEMPERATURE, "POWER|TEMPERATURE"},
-			 {MetricGroup::ECC, MetricGroup::CLOCK, "ECC|CLOCK"},
-			 {MetricGroup::ECC, MetricGroup::FAN, "ECC|FAN"},
 			 {MetricGroup::FAN, MetricGroup::POWER, "FAN|POWER"},
 			 {MetricGroup::FAN, MetricGroup::TEMPERATURE, "FAN|TEMPERATURE"},
 		 })) {
@@ -669,7 +822,6 @@ TEST_CASE("resolveQuery matches getMetricsByGroup for each canonical group name"
 	check("FAN", MetricGroup::FAN);
 	check("MEMORY", MetricGroup::MEMORY);
 	check("POWER", MetricGroup::POWER);
-	check("ECC", MetricGroup::ECC);
 	check("CLOCK", MetricGroup::CLOCK);
 }
 
@@ -684,7 +836,6 @@ TEST_CASE("resolveQuery single-letter aliases match their canonical groups")
 			 {"m", MetricGroup::MEMORY},
 			 {"u", MetricGroup::UTILIZATION},
 			 {"c", MetricGroup::CLOCK},
-			 {"e", MetricGroup::ECC},
 			 {"f", MetricGroup::FAN},
 			 {"t", MetricGroup::PCI},
 			 {"x", MetricGroup::EU_ARRAY},
@@ -1100,10 +1251,10 @@ TEST_CASE("inputsOf: only EU fields request the OA metric streamer")
 		REQUIRE(fields.size() == 1);
 		CHECK(hasInput(inputsOf(fields), MetricInput::EU));
 	}
-	// utilization.gpu prefers EU active% and falls back to engine/fdinfo, so it needs all three.
+	// utilization.gpu is the busiest engine, from sysman or fdinfo; it never opens the streamer.
 	const auto gpuUtil = resolveQuery("utilization.gpu");
 	REQUIRE(gpuUtil.size() == 1);
-	CHECK(hasInput(inputsOf(gpuUtil), MetricInput::EU));
+	CHECK_FALSE(hasInput(inputsOf(gpuUtil), MetricInput::EU));
 	CHECK(hasInput(inputsOf(gpuUtil), MetricInput::ENGINE));
 	CHECK(hasInput(inputsOf(gpuUtil), MetricInput::FDINFO));
 
@@ -1329,9 +1480,15 @@ TEST_CASE_FIXTURE(ZeroDeviceFixture, "populateMetricCacheContinuous promotes pre
 		{.type = ZES_ENGINE_GROUP_COPY_SINGLE, .tileId = 1, .activeTime = 50, .timestamp = 1200},
 	};
 	prev.populated = true;
+	// An "unknown" serial number and when to query it again: dropping the deadline would query
+	// it on every iteration.
+	prev.serialNumber = "unknown";
+	prev.serialRetryAt = std::chrono::steady_clock::now() + std::chrono::minutes{1};
 
 	const MetricCache curr = populateMetricCacheContinuous(di, prev);
 
+	CHECK(curr.serialNumber == prev.serialNumber);
+	CHECK(curr.serialRetryAt == prev.serialRetryAt);
 	CHECK(curr.cardPowerBefore.energy == prev.cardPowerAfter.energy);
 	CHECK(curr.cardPowerBefore.ts == prev.cardPowerAfter.ts);
 	CHECK(curr.gpuPowerBefore.energy == prev.gpuPowerAfter.energy);
@@ -1467,4 +1624,239 @@ TEST_CASE_FIXTURE(ZeroDeviceFixture, "populateMetricCache skips the sleep when M
 
 	CHECK(cache.populated);
 	CHECK(elapsed < std::chrono::seconds{1});
+}
+
+// -- clock fields added for the full device report ---------------------------------------
+
+TEST_CASE("describeClockList: evenly spaced clocks are summarised as a range")
+{
+	CHECK(metrics::clock::describeClockList(std::vector<double>{400, 450, 500, 550, 600}) == "400-600 step 50");
+	CHECK(metrics::clock::describeClockList(std::vector<double>{300, 400, 500}) == "300-500 step 100");
+}
+
+TEST_CASE("describeClockList: short, uneven or descending lists are written out")
+{
+	CHECK(metrics::clock::describeClockList({}).empty());
+	CHECK(metrics::clock::describeClockList(std::vector<double>{400}) == "400");
+	CHECK(metrics::clock::describeClockList(std::vector<double>{400, 450}) == "400; 450");
+	CHECK(metrics::clock::describeClockList(std::vector<double>{400, 450, 500, 550, 2850}) ==
+		  "400; 450; 500; 550; 2850");
+	CHECK(metrics::clock::describeClockList(std::vector<double>{600, 500, 400}) == "600; 500; 400");
+	CHECK(metrics::clock::describeClockList(std::vector<double>{400, 400, 400}) == "400; 400; 400");
+}
+
+TEST_CASE("describeClockList: a list never contains a comma, so it cannot break CSV output")
+{
+	CHECK(metrics::clock::describeClockList(std::vector<double>{1, 2, 4, 8}).find(',') == std::string::npos);
+	CHECK(metrics::clock::describeClockList(std::vector<double>{1, 2, 3, 4}).find(',') == std::string::npos);
+}
+
+TEST_CASE("clocks.supported.graphics is a Static SUPPORTED_CLOCKS field in MHz")
+{
+	const auto field = findMetric("clocks.supported.graphics");
+	REQUIRE(field.has_value());
+	CHECK(field->unit == "MHz");
+	CHECK(field->source == MetricSource::Static);
+	CHECK(field->groups == MetricGroup::SUPPORTED_CLOCKS);
+}
+
+TEST_CASE("the SUPPORTED_CLOCKS section parses and selects its fields")
+{
+	CHECK(hasGroup(parseGroupMask("supported_clocks"), MetricGroup::SUPPORTED_CLOCKS));
+	CHECK_FALSE(getMetricsByGroup(MetricGroup::SUPPORTED_CLOCKS).empty());
+	// The new section has no one-letter shortcut, so no letter selects it.
+	CHECK_FALSE(hasGroup(parseGroupMask("p"), MetricGroup::SUPPORTED_CLOCKS));
+}
+
+TEST_CASE("fields no current device reports are not in the registry")
+{
+	// power.limit.default and power.limit.min are back: the query report leaves them out where the
+	// driver lacks them, and --verbose says Not Supported.
+	for (const std::string_view name : {"retired_pages.count"}) {
+		CHECK_FALSE_MESSAGE(findMetric(name).has_value(), name);
+	}
+	CHECK(parseGroupMask("page_retirement") == MetricGroup::NONE);
+}
+
+TEST_CASE("throttle reasons: each is one distinct flag with a distinct registry field")
+{
+	const auto &reasons = metrics::clock::THROTTLE_REASONS;
+	for (std::size_t i = 0; i < reasons.size(); ++i) {
+		CHECK_MESSAGE(std::popcount(static_cast<uint32_t>(reasons[i].flag)) == 1, reasons[i].metricName);
+		for (std::size_t j = i + 1; j < reasons.size(); ++j) {
+			CHECK(reasons[i].flag != reasons[j].flag);
+			CHECK(reasons[i].metricName != reasons[j].metricName);
+			CHECK(reasons[i].key != reasons[j].key);
+			CHECK(reasons[i].shortName != reasons[j].shortName);
+		}
+	}
+}
+
+TEST_CASE("throttle reasons: every one is in the registry as a Live PERFORMANCE field")
+{
+	for (const auto &reason : metrics::clock::THROTTLE_REASONS) {
+		const auto field = findMetric(reason.metricName);
+		REQUIRE_MESSAGE(field.has_value(), reason.metricName);
+		CHECK(field->groups == MetricGroup::PERFORMANCE);
+		CHECK(field->source == MetricSource::Live);
+		CHECK(field->inputs == MetricInput::NONE);
+		CHECK_FALSE(field->description.empty());
+	}
+	CHECK(getMetricsByGroup(MetricGroup::PERFORMANCE).size() >= metrics::clock::THROTTLE_REASONS.size());
+	CHECK(hasGroup(parseGroupMask("PERFORMANCE"), MetricGroup::PERFORMANCE));
+	CHECK_FALSE(hasGroup(parseGroupMask("p"), MetricGroup::PERFORMANCE));
+}
+
+TEST_CASE("clocks.requested.graphics is a Live CLOCK field in MHz")
+{
+	const auto field = findMetric("clocks.requested.graphics");
+	REQUIRE(field.has_value());
+	CHECK(field->unit == "MHz");
+	CHECK(field->source == MetricSource::Live);
+	CHECK(field->groups == MetricGroup::CLOCK);
+	CHECK(field->inputs == MetricInput::NONE);
+}
+
+// -- scheduler mode field added for the full device report --------------------------------
+
+TEST_CASE("schedulerModeName: each mode has the word the config command uses")
+{
+	using metrics::mode::schedulerModeName;
+	CHECK(schedulerModeName(ZES_SCHED_MODE_TIMEOUT) == "timeout");
+	CHECK(schedulerModeName(ZES_SCHED_MODE_TIMESLICE) == "timeslice");
+	CHECK(schedulerModeName(ZES_SCHED_MODE_EXCLUSIVE) == "exclusive");
+	CHECK(schedulerModeName(ZES_SCHED_MODE_COMPUTE_UNIT_DEBUG) == "unknown");
+	CHECK(schedulerModeName(static_cast<zes_sched_mode_t>(0x7fffffff)) == "unknown");
+}
+
+TEST_CASE("scheduler.mode is the Static COMPUTE field")
+{
+	const auto field = findMetric("scheduler.mode");
+	REQUIRE(field.has_value());
+	CHECK(field->groups == MetricGroup::COMPUTE);
+	CHECK(field->source == MetricSource::Static);
+	CHECK(getMetricsByGroup(MetricGroup::COMPUTE).size() == 1);
+}
+
+TEST_CASE_FIXTURE(ZeroDeviceFixture, "scheduler.mode: a device with no scheduler reports it unsupported")
+{
+	const MetricCache cache;
+	const auto field = findMetric("scheduler.mode");
+	REQUIRE(field.has_value());
+	MetricValue out = "untouched";
+	CHECK(field->getter(di, out, cache) == ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	CHECK(out == "untouched");
+}
+
+// -- temperature threshold fields added for the full device report ------------------------
+
+TEST_CASE("temperature thresholds are registered Static TEMPERATURE fields in degrees Celsius")
+{
+	for (const std::string_view name :
+		 {"temperature.gpu.threshold.throttle", "temperature.gpu.threshold.shutdown",
+		  "temperature.memory.threshold.throttle", "temperature.memory.threshold.shutdown"}) {
+		const auto field = findMetric(name);
+		REQUIRE_MESSAGE(field.has_value(), name);
+		CHECK_MESSAGE(field->unit == "C", name);
+		CHECK_MESSAGE(field->source == MetricSource::Static, name);
+		CHECK_MESSAGE(field->groups == MetricGroup::TEMPERATURE, name);
+		CHECK_MESSAGE(field->inputs == MetricInput::NONE, name);
+	}
+}
+
+TEST_CASE("a field that reads the firmware reads no window data, and VBIOS and serial are such fields")
+{
+	std::vector<std::string_view> firmwareFields;
+	for (const auto &m : getQueryMetrics()) {
+		if (m.readsFirmware) {
+			CHECK_MESSAGE(m.inputs == MetricInput::NONE, m.name);
+			firmwareFields.push_back(m.name);
+		}
+	}
+	CHECK(std::ranges::find(firmwareFields, "vbios_version") != firmwareFields.end());
+	CHECK(std::ranges::find(firmwareFields, "serial") != firmwareFields.end());
+}
+
+TEST_CASE_FIXTURE(ZeroDeviceFixture,
+				  "PCIe throughput reads an idle link as zero, and moved counters under a frozen timestamp as no value")
+{
+	const auto read = [this](std::string_view name, const MetricCache &cache) -> std::optional<std::string> {
+		const auto field = findMetric(name);
+		REQUIRE(field.has_value());
+		MetricValue out;
+		return field->getter(di, out, cache) == ZE_RESULT_SUCCESS ? std::optional{out} : std::nullopt;
+	};
+	MetricCache cache;
+	cache.pcieAvail = true;
+	cache.pcieBandwidthAvail = true;
+	cache.pcieBefore = {.tx = 5000, .rx = 7000, .timeUs = 1000};
+
+	SUBCASE("idle: neither the counters nor the timestamp moved")
+	{
+		cache.pcieAfter = cache.pcieBefore;
+		for (const auto name :
+			 {"pcie.tx.throughput", "pcie.rx.throughput", "pcie.tx.throughput.kbs", "pcie.rx.throughput.kbs"}) {
+			CHECK_MESSAGE(read(name, cache) == std::optional<std::string>{"0"}, name);
+		}
+	}
+	SUBCASE("counters moved under an unchanged timestamp")
+	{
+		cache.pcieAfter = {.tx = 6000, .rx = 7000, .timeUs = 1000};
+		CHECK_FALSE(read("pcie.tx.throughput", cache).has_value());
+		CHECK_FALSE(read("pcie.tx.throughput.kbs", cache).has_value());
+		CHECK(read("pcie.rx.throughput.kbs", cache) == std::optional<std::string>{"0"});
+	}
+	SUBCASE("a normal window: 1000 bytes over 1000 us")
+	{
+		cache.pcieAfter = {.tx = 6000, .rx = 7000, .timeUs = 2000};
+		CHECK(read("pcie.tx.throughput", cache) == std::optional<std::string>{"1"});
+		CHECK(read("pcie.tx.throughput.kbs", cache) == std::optional<std::string>{"1000"});
+		CHECK(read("pcie.rx.throughput.kbs", cache) == std::optional<std::string>{"0"});
+	}
+	SUBCASE("a byte count whose rate times 10^6 exceeds 64 bits")
+	{
+		// 2 * 10^13 bytes over 1 s: 2 * 10^19 would wrap 64 bits if formed first.
+		cache.pcieAfter = {.tx = 5000 + 20'000'000'000'000ULL, .rx = 7000, .timeUs = 1000 + 1'000'000};
+		CHECK(read("pcie.tx.throughput.kbs", cache) == std::optional<std::string>{"20000000000"});
+	}
+	SUBCASE("counters or timestamp that went backwards give no rate")
+	{
+		cache.pcieAfter = {.tx = 4000, .rx = 7000, .timeUs = 2000};
+		CHECK_FALSE(read("pcie.tx.throughput", cache).has_value());
+		CHECK_FALSE(read("pcie.tx.throughput.kbs", cache).has_value());
+		cache.pcieAfter = {.tx = 6000, .rx = 7000, .timeUs = 500};
+		CHECK_FALSE(read("pcie.tx.throughput.kbs", cache).has_value());
+	}
+	SUBCASE("counters not read at both ends")
+	{
+		cache.pcieAvail = false;
+		cache.pcieAfter = cache.pcieBefore;
+		CHECK_FALSE(read("pcie.tx.throughput.kbs", cache).has_value());
+	}
+}
+
+// -- class code and recovery action fields ------------------------------------------------
+
+TEST_CASE("pci.base_class and pci.sub_class are Static PCI fields")
+{
+	for (const std::string_view name : {"pci.base_class", "pci.sub_class"}) {
+		const auto field = findMetric(name);
+		REQUIRE_MESSAGE(field.has_value(), name);
+		CHECK_MESSAGE(field->source == MetricSource::Static, name);
+		CHECK_MESSAGE(field->groups == MetricGroup::PCI, name);
+		CHECK_MESSAGE(field->inputs == MetricInput::NONE, name);
+	}
+}
+
+TEST_CASE("recoveryActionOf: none, a repair, or any other reset reason")
+{
+	using metrics::identity::recoveryActionOf;
+	CHECK(recoveryActionOf(0) == "None");
+	CHECK(recoveryActionOf(ZES_RESET_REASON_FLAG_WEDGED) == "Reset");
+	CHECK(recoveryActionOf(ZES_RESET_REASON_FLAG_REPAIR) == "Reset to repair");
+	CHECK(recoveryActionOf(ZES_RESET_REASON_FLAG_WEDGED | ZES_RESET_REASON_FLAG_REPAIR) == "Reset to repair");
+	const auto field = findMetric("recovery_action");
+	REQUIRE(field.has_value());
+	CHECK(field->groups == MetricGroup::IDENTITY);
+	CHECK(field->source == MetricSource::Live);
 }

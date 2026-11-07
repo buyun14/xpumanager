@@ -28,9 +28,29 @@ stats:
 		printf " %-14s %5d %8d\n" $$ext $$files $$lines; \
 	done
 
+.PHONY: versions
+# List versions specified in XPUMD files that may need to be updated for a release
+versions:
+	@echo "CHANGES.md: $$(awk '/^##/{print;exit}' docs/CHANGES.md)" && \
+	echo "API: $$(find -name deviceinfo.proto | xargs grep go_package)" && \
+	echo "XPUMD_VERSION: $(XPUMD_VERSION)" && \
+	grep -H version: charts/xpumd/Chart.yaml && \
+	grep -H XPU charts/xpumd/json/dashboard.json
+
+# Helm chart version must be a valid semver
+.PHONY: versions-update
+# Update XPUMD version in files that are not updated automatically
+versions-update:
+	scripts/semver-check.py $(XPUMD_VERSION)
+	sed -i 's/^version:.*$$/version: $(XPUMD_VERSION)/g' charts/xpumd/Chart.yaml
+	sed -i 's/ 2[.][0-9]\+[.][0-9]\+[^ ]* / $(XPUMD_VERSION) /' charts/xpumd/json/dashboard.json
+
+
 # --- Build targets ---
 
-OTEL_VERSION ?= 0.162.0
+XPUMD_VERSION ?= $(shell git describe --tags --dirty --always | tr / -)
+
+OTEL_VERSION ?= 0.163.0
 IMAGE_REPOSITORY ?= registry.local/xpumd
 IMAGE_TAG ?= latest
 IMAGE_PULL_POLICY ?= IfNotPresent
@@ -50,14 +70,11 @@ XPUMD_PKG := $(shell go list -m)
 LEVEL_ZERO_GO_PKG := $(shell go -C level-zero-go list -m)
 GO_COVER_FLAGS := -cover -coverpkg=$(XPUMD_PKG)/...,$(LEVEL_ZERO_GO_PKG)/...
 
-.PHONY: builder-config.yaml
-builder-config.yaml:
-	sed 's/@OTEL_VERSION@/$(OTEL_VERSION)/g' builder-config.yaml.in > builder-config.yaml
-
 .PHONY: build
 # Build xpumd + xpuinfo-cli
-build: builder-config.yaml
-	go tool -modfile tools/go.mod builder --ldflags "$(GO_FLAGS)" --config=builder-config.yaml
+build:
+	sed -e 's/@OTEL_VERSION@/$(OTEL_VERSION)/' -e 's/@XPUMD_VERSION@/$(XPUMD_VERSION)/' builder-config.yaml.in |\
+	  go tool -modfile tools/go.mod builder --ldflags "$(GO_FLAGS)" --config=/dev/stdin
 	go -C dist build --ldflags "$(GO_FLAGS)" github.com/intel/xpumanager/xpumd/exporter/intelxpuinfo/xpuinfo-cli
 
 .PHONY: level-zero-stub
@@ -67,9 +84,13 @@ level-zero-stub:
 
 .PHONY: build-stub
 # Build xpumd + xpuinfo-cli against the level-zero-stub driver
-build-stub: level-zero-stub builder-config.yaml
-	sed -i 's#output_path: ./dist#output_path: ./dist-stub#' builder-config.yaml
-	$(BUILD_STUB_ENV) go tool -modfile tools/go.mod builder --ldflags "$(GO_FLAGS)" --config=builder-config.yaml
+build-stub: level-zero-stub
+	sed \
+	  -e 's/@OTEL_VERSION@/$(OTEL_VERSION)/' \
+	  -e 's/@XPUMD_VERSION@/$(XPUMD_VERSION)/' \
+	  -e 's#output_path: ./dist#output_path: ./dist-stub#' \
+	  builder-config.yaml.in | \
+	  $(BUILD_STUB_ENV) go tool -modfile tools/go.mod builder --ldflags "$(GO_FLAGS)" --config=/dev/stdin
 	$(BUILD_STUB_ENV) go -C dist-stub build --ldflags "$(GO_FLAGS)" github.com/intel/xpumanager/xpumd/exporter/intelxpuinfo/xpuinfo-cli
 	@echo "Give stub driver config with SYSMAN_STUB_CONFIG, for example:"
 	@echo "  SYSMAN_STUB_CONFIG=level-zero-go/level-zero-stub/example-config.yaml ./dist-stub/xpumd" --config config-example.yaml
@@ -77,27 +98,31 @@ build-stub: level-zero-stub builder-config.yaml
 
 .PHONY: build-cover
 # Build coverage-instrumented xpumd + xpuinfo-cli
-build-cover: builder-config.yaml
-	go tool -modfile tools/go.mod builder --skip-compilation --config=builder-config.yaml
+build-cover:
+	sed -e 's/@OTEL_VERSION@/$(OTEL_VERSION)/' -e 's/@XPUMD_VERSION@/$(XPUMD_VERSION)/' builder-config.yaml.in |\
+	  go tool -modfile tools/go.mod builder --skip-compilation --config=/dev/stdin
 	go -C dist build $(GO_COVER_FLAGS) --ldflags "$(GO_FLAGS)" -o xpumd .
 	go -C dist build $(GO_COVER_FLAGS) --ldflags "$(GO_FLAGS)" github.com/intel/xpumanager/xpumd/exporter/intelxpuinfo/xpuinfo-cli
 
 .PHONY: race
 # Build race detector versions (incompatible with PIE mode)
 # Log errors to file with: GORACE=log_path=xpumd-races
-race: builder-config.yaml
-	GOFLAGS=-race go tool -modfile tools/go.mod builder --config=builder-config.yaml
+race:
+	sed -e 's/@OTEL_VERSION@/$(OTEL_VERSION)/' -e 's/@XPUMD_VERSION@/$(XPUMD_VERSION)/' builder-config.yaml.in |\
+	  GOFLAGS=-race go tool -modfile tools/go.mod builder --config=/dev/stdin
 	go -C dist build -race github.com/intel/xpumanager/xpumd/exporter/intelxpuinfo/xpuinfo-cli
 
 .PHONY: docker-build
 # Build the xpumd container image
 docker-build:
-	docker build --build-arg BACKEND=$(BACKEND) -t $(IMAGE_REPOSITORY):$(IMAGE_TAG) .
+	docker build --build-arg XPUMD_VERSION=$(XPUMD_VERSION) \
+	  --build-arg BACKEND=$(BACKEND) -t $(IMAGE_REPOSITORY):$(IMAGE_TAG) .
 
 .PHONY: docker-build-cover
 # Build image with coverage-instrumented binaries
 docker-build-cover:
-	docker build --build-arg BACKEND=$(BACKEND) --build-arg BUILD_TARGET=build-cover \
+	docker build --build-arg XPUMD_VERSION=$(XPUMD_VERSION) \
+	  --build-arg BACKEND=$(BACKEND) --build-arg BUILD_TARGET=build-cover \
 	  -t $(IMAGE_REPOSITORY):$(IMAGE_TAG) .
 
 .PHONY: generate
@@ -119,7 +144,7 @@ generate-mods:
 generate-proto: install-protoc
 	PATH=tools/bin/ protoc --go_out=. --go_opt=paths=source_relative \
 	                       --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-	                       exporter/intelxpuinfo/api/deviceinfo/v1alpha1/deviceinfo.proto
+	                       exporter/intelxpuinfo/api/deviceinfo/v1alpha2/deviceinfo.proto
 
 .PHONY: generate-dockerfile-args
 # Sync the compute-runtime backend build args from the Level-Zero Go example Dockerfile
@@ -227,7 +252,7 @@ coverage-integration-test-existing-cluster:
 
 .PHONY: lint
 # Run all linters
-lint: codespell golint shellcheck
+lint: codespell golint shellcheck yamllint
 
 .PHONY: codespell
 # Run codespell on all sources (requires: <apt|dnf> install codespell)
@@ -247,11 +272,27 @@ golint:
 	fi; \
 	echo "✓ No linter issues found"
 
+# Skipped for "lint" target as Python scripts are just dev helpers, not used in build or CI
+.PHONY: ruff
+# Lint Python files (requires: <apt|dnf> install ruff)
+ruff:
+	@echo -e "\nruff: linting Python files...\n"
+	git ls-files -z '*.py' | xargs -0 ruff check
+
 .PHONY: shellcheck
 # Lint shell scripts (requires: <apt|dnf> install shellcheck)
 shellcheck:
 	@echo -e "\nshellcheck: linting shell scripts...\n"
 	git ls-files -z '*.sh' | xargs -0 shellcheck
+
+# - skip Helm chart template files as they include Jinja syntax
+# - warnings are disabled because e.g. chart "values.yaml" includes
+#   intentional trailing whitespace after @default directives
+.PHONY: yamllint
+# Lint YAML files (requires: <apt|dnf> install yamllint)
+yamllint:
+	@echo -e "\nyamllint: linting non-Jinja'd YAML files...\n"
+	git ls-files -z '*.yml' '*.yaml' | grep -z -v templates/ | xargs -0 yamllint --no-warnings
 
 .PHONY: check-format
 # Check formatting of all sources

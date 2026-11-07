@@ -62,7 +62,114 @@ constexpr auto composite = // NOLINT(readability-identifier-naming)
 				.groups = MetricGroup::TEMPERATURE,
 				.getter = tempGetter<&::temperature::getCompositeTemp>};
 
-constexpr auto ALL = std::to_array<QueryMetric>({gpu, mem, composite});
+/**
+ * @brief Reads one of the temperature thresholds configured for the device.
+ *
+ * These come from the device's configured thresholds, the ones the health check compares
+ * against, not from a sensor. A threshold that was not filled in reads as zero and is unsupported.
+ *
+ * @tparam READ     The HAL getter that fills in the throttle and shutdown thresholds of one sensor.
+ * @tparam SHUTDOWN True for the shutdown threshold, false for the throttle threshold.
+ *
+ * @param[in]  d   Device to query.
+ * @param[out] out Set to the threshold in degrees Celsius. Unchanged on failure.
+ *
+ * @retval ZE_RESULT_SUCCESS                   The threshold is known.
+ * @retval ZE_RESULT_ERROR_UNSUPPORTED_FEATURE No temperature HAL, or the threshold was not filled in.
+ * @retval Other                               Any error from the temperature HAL.
+ */
+template <ze_result_t (::temperature::*READ)(zes_device_handle_t, uint32_t *, uint32_t *), bool SHUTDOWN>
+ze_result_t thresholdGetter(devInfo &d, MetricValue &out, const MetricCache &)
+{
+	auto *t = d.dev->getTemperature();
+	if (t == nullptr) {
+		return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+	}
+	uint32_t throttle = 0;
+	uint32_t shutdown = 0;
+	if (const auto r = (t->*READ)(d.zesDeviceHdl, &throttle, &shutdown); r != ZE_RESULT_SUCCESS) {
+		return r;
+	}
+	const uint32_t degrees = SHUTDOWN ? shutdown : throttle;
+	if (degrees == 0U) {
+		return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+	}
+	out = xpum::compat::format("{}", degrees);
+	return ZE_RESULT_SUCCESS;
+}
+
+constexpr auto gpuThrottle = // NOLINT(readability-identifier-naming)
+	QueryMetric{.name = "temperature.gpu.threshold.throttle",
+				.unit = "C",
+				.description = "Configured GPU core temperature at which the clock is throttled",
+				.source = MetricSource::Static,
+				.groups = MetricGroup::TEMPERATURE,
+				.getter = thresholdGetter<&::temperature::getCoreThreshold, false>};
+
+constexpr auto gpuShutdown = // NOLINT(readability-identifier-naming)
+	QueryMetric{.name = "temperature.gpu.threshold.shutdown",
+				.unit = "C",
+				.description = "Configured GPU core temperature at which the device shuts down",
+				.source = MetricSource::Static,
+				.groups = MetricGroup::TEMPERATURE,
+				.getter = thresholdGetter<&::temperature::getCoreThreshold, true>};
+
+constexpr auto memThrottle = // NOLINT(readability-identifier-naming)
+	QueryMetric{.name = "temperature.memory.threshold.throttle",
+				.unit = "C",
+				.description = "Configured GPU memory temperature at which the clock is throttled",
+				.source = MetricSource::Static,
+				.groups = MetricGroup::TEMPERATURE,
+				.getter = thresholdGetter<&::temperature::getMemoryThreshold, false>};
+
+constexpr auto memShutdown = // NOLINT(readability-identifier-naming)
+	QueryMetric{.name = "temperature.memory.threshold.shutdown",
+				.unit = "C",
+				.description = "Configured GPU memory temperature at which the device shuts down",
+				.source = MetricSource::Static,
+				.groups = MetricGroup::TEMPERATURE,
+				.getter = thresholdGetter<&::temperature::getMemoryThreshold, true>};
+
+/**
+ * @brief Reads the maximum operating temperature of one sensor type.
+ *
+ * @tparam TYPE The sensor type.
+ *
+ * @retval ZE_RESULT_SUCCESS                   @p out holds the maximum in Celsius.
+ * @retval ZE_RESULT_ERROR_UNSUPPORTED_FEATURE No temperature HAL, or no sensor of @p TYPE reports one.
+ */
+template <zes_temp_sensors_t TYPE> ze_result_t maxTempGetter(devInfo &d, MetricValue &out, const MetricCache &)
+{
+	auto *t = d.dev->getTemperature();
+	if (t == nullptr) {
+		return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+	}
+	auto val = 0.0;
+	const auto r = t->getMaxTemp(TYPE, &val);
+	if (r == ZE_RESULT_SUCCESS) {
+		out = xpum::compat::format("{:.0f}", val);
+	}
+	return r;
+}
+
+constexpr auto gpuMax = // NOLINT(readability-identifier-naming)
+	QueryMetric{.name = "temperature.gpu.max",
+				.unit = "C",
+				.description = "Highest temperature the driver says the GPU sensor can operate at",
+				.source = MetricSource::Static,
+				.groups = MetricGroup::TEMPERATURE,
+				.getter = maxTempGetter<ZES_TEMP_SENSORS_GPU>};
+
+constexpr auto memMax = // NOLINT(readability-identifier-naming)
+	QueryMetric{.name = "temperature.memory.max",
+				.unit = "C",
+				.description = "Highest temperature the driver says the memory sensor can operate at",
+				.source = MetricSource::Static,
+				.groups = MetricGroup::TEMPERATURE,
+				.getter = maxTempGetter<ZES_TEMP_SENSORS_MEMORY>};
+
+constexpr auto ALL = std::to_array<QueryMetric>(
+	{gpu, mem, composite, gpuThrottle, gpuShutdown, memThrottle, memShutdown, gpuMax, memMax});
 
 } // namespace
 

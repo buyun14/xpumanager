@@ -84,6 +84,7 @@ private:
 	devProps deviceProperties;
 	bool igpu;
 	bool survMode;
+	bool pciOnly = false; // built by pciOnlyInit(): no Level Zero handles at all
 	int amc;
 	char drmDevPath[MAX_PATH];
 
@@ -137,6 +138,9 @@ public:
 
 	ze_result_t zesGetDevProps(zes_device_handle_t dev, zes_device_properties_t *zesDevProp);
 	ze_result_t getDeviceHealth(zes_device_health_status_ext_t *pHealth);
+	[[nodiscard]] ze_result_t getResetReasons(zes_reset_reason_flags_t &reasons);
+	[[nodiscard]] ze_result_t getRepairStatus(zes_repair_status_t &status);
+	[[nodiscard]] ze_result_t getPerformanceFactor(zes_engine_type_flags_t engines, double &factor);
 	ze_result_t setDeviceHealth(zes_device_health_status_ext_t health);
 	bool isIGPU() const { return igpu; }
 	int getAmcIndex() const { return amc; }
@@ -151,6 +155,9 @@ public:
 					 zes_device_handle_t *totalZesDevices, uint32_t totalZesDeviceCount);
 	metric *getMetric() { return &metricInstance; }
 	ze_result_t smDevInit(zes_driver_handle_t zesDri, zes_device_handle_t zesDev);
+	void pciOnlyInit(const zes_pci_address_t &address);
+	[[nodiscard]] bool isPciOnly() const { return pciOnly; }
+	[[nodiscard]] ze_result_t resetThroughPci();
 	ze_result_t run();
 	ze_context_handle_t getContext() const { return context; }
 	ze_device_handle_t getDeviceHandle() const { return zeDevice; }

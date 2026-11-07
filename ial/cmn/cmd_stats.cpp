@@ -8,6 +8,7 @@
 #include <temperature_ext.h>
 #include "debug.h"
 #include <CLI/CLI.hpp>
+#include <sysprocess.h>
 #include "memory.h"
 #include "fan.h"
 #include "metric.h"
@@ -18,11 +19,18 @@
 #include "metrics_registry.h"
 #include <assert.h>
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cmath>
+#include <functional>
+#include <future>
 #include <numeric>
+#include <optional>
+#include <ranges>
+#include <string_view>
 #include "utility/compat/format.h"
 #include <thread>
+#include "utility/watchdog/watchdog.h"
 
 /**
  * @brief Structure pairing an experimental RAS error category enum with its display name
@@ -426,11 +434,13 @@ cmdStats::collectFrequencyMetricsPerTile(frequency *frequencyHandler,
 		return ZE_RESULT_SUCCESS; // Not an error, just not supported
 	}
 
+	// Level Zero marks an unknown frequency with a negative value. 0 is a real reading: the
+	// actual clock of a GT that is idle in C6, so it is kept rather than shown as N/A.
 	std::map<uint32_t, double> gpuTileFreqs;
 	ze_result_t result = frequencyHandler->getCurFreqPerTile(ZES_FREQ_DOMAIN_GPU, gpuTileFreqs);
 	if (result == ZE_RESULT_SUCCESS) {
 		for (const auto &[tileId, freq] : gpuTileFreqs) {
-			if (freq > 0.0) {
+			if (freq >= 0.0) {
 				gpuFreqSamplesPerTile[tileId].push_back(freq);
 				DBG("Tile {} GPU frequency sample: {:.2f} MHz\n", tileId, freq);
 			}
@@ -441,7 +451,7 @@ cmdStats::collectFrequencyMetricsPerTile(frequency *frequencyHandler,
 	result = frequencyHandler->getCurFreqPerTile(ZES_FREQ_DOMAIN_MEDIA, mediaTileFreqs);
 	if (result == ZE_RESULT_SUCCESS) {
 		for (const auto &[tileId, freq] : mediaTileFreqs) {
-			if (freq > 0.0) {
+			if (freq >= 0.0) {
 				mediaFreqSamplesPerTile[tileId].push_back(freq);
 				DBG("Tile {} Media frequency sample: {:.2f} MHz\n", tileId, freq);
 			}
@@ -452,7 +462,7 @@ cmdStats::collectFrequencyMetricsPerTile(frequency *frequencyHandler,
 	result = frequencyHandler->getCurFreqPerTile(ZES_FREQ_DOMAIN_MEMORY, memoryTileFreqs);
 	if (result == ZE_RESULT_SUCCESS) {
 		for (const auto &[tileId, freq] : memoryTileFreqs) {
-			if (freq > 0.0) {
+			if (freq >= 0.0) {
 				memoryFreqSamplesPerTile[tileId].push_back(freq);
 				DBG("Tile {} Memory frequency sample: {:.2f} MHz\n", tileId, freq);
 			}
@@ -1092,6 +1102,248 @@ void cmdStats::populateEngineStats(const std::vector<EngineInstanceTracker> &tra
 	}
 }
 
+namespace {
+
+/** One device's stats, collected on its own thread by cmdStats::run(). */
+struct DeviceStatsResult
+{
+	ze_result_t status{};
+	nlohmann::ordered_json deviceJson;
+};
+
+/** Pointer to one of the DeviceMetrics per-tile sample series. */
+using TileSeries = std::map<uint32_t, std::vector<double>> DeviceMetrics::*;
+
+/** One engine class: where to read it from fdinfo, where to publish it. */
+struct FdinfoUtilCategory
+{
+	std::optional<float> ProcUtil::*field;
+	TileSeries series;
+};
+
+/** The four engine classes fdinfo can attribute, in display order. */
+// clang-format off
+inline constexpr auto FDINFO_UTIL_CATEGORIES = std::to_array<FdinfoUtilCategory>({
+	{&ProcUtil::compute, &DeviceMetrics::computeUtilPerTile},
+	{&ProcUtil::render,  &DeviceMetrics::renderUtilPerTile },
+	{&ProcUtil::copy,    &DeviceMetrics::copyUtilPerTile   },
+	{&ProcUtil::media,   &DeviceMetrics::mediaUtilPerTile  },
+});
+// clang-format on
+
+/** One published per-process utilization field. */
+struct ProcUtilField
+{
+	std::string_view jsonKey;
+	std::string_view label;
+	std::optional<float> ProcUtil::*field;
+};
+
+/** Single source of truth for the per-process fields, so JSON and text output cannot drift. */
+// clang-format off
+inline constexpr auto PROC_UTIL_FIELDS = std::to_array<ProcUtilField>({
+	{"util_compute_pct", "compute",   &ProcUtil::compute },
+	{"util_copy_pct",    "copy",      &ProcUtil::copy    },
+	{"util_render_pct",  "render",    &ProcUtil::render  },
+	{"util_media_pct",   "media",     &ProcUtil::media   },
+	{"eu_active_pct",    "eu_active", &ProcUtil::euActive},
+	{"eu_stall_pct",     "eu_stall",  &ProcUtil::euStall },
+});
+// clang-format on
+
+} // namespace
+
+/**
+ * @brief Fill any per-tile utilization series Level Zero left empty with an fdinfo aggregate.
+ *
+ * fdinfo reports per-device, not per-tile, counters, so the result is a device-level
+ * approximation filed under tile 0 rather than a real per-tile breakdown. Series are gated
+ * individually because the L0 engine groups fail individually.
+ *
+ * @param utilMap    Per-process engine utilisation from fdinfo::delta(), self PID excluded.
+ * @param measurable Engine classes fdinfo reported for the device in the same window.
+ * @param metrics    Per-tile series filled in-place; untouched where L0 already reported.
+ */
+void cmdStats::applyFdinfoUtilFallback(const fdinfo::PidUtilMap &utilMap, const FdinfoEngineKeys &measurable,
+									   DeviceMetrics &metrics)
+{
+	// Sum each category across every visible process. A category fdinfo measures on this
+	// device starts at 0, so an idle one reads 0% as it does on the sysman path; one it
+	// cannot measure stays nullopt and is left absent rather than published as a real 0%.
+	std::array<std::optional<double>, FDINFO_UTIL_CATEGORIES.size()> sums{};
+	fdinfo::EngineUtilMap idle;
+	for (const auto &key : measurable) {
+		idle.emplace(key, 0.0F);
+	}
+	const ProcUtil measured = fdinfo::toProcUtil(idle);
+	for (size_t i = 0; i < FDINFO_UTIL_CATEGORIES.size(); ++i) {
+		if ((measured.*FDINFO_UTIL_CATEGORIES[i].field).has_value()) {
+			sums[i] = 0.0;
+		}
+	}
+	for (const auto &engUtils : std::views::values(utilMap)) {
+		const ProcUtil pu = fdinfo::toProcUtil(engUtils);
+		for (size_t i = 0; i < FDINFO_UTIL_CATEGORIES.size(); ++i) {
+			if (const auto pct = pu.*FDINFO_UTIL_CATEGORIES[i].field) {
+				sums[i] = sums[i].value_or(0.0) + static_cast<double>(*pct);
+			}
+		}
+	}
+
+	const auto fill = [&metrics](TileSeries series, double value) {
+		if ((metrics.*series).empty()) {
+			(metrics.*series)[0].push_back(std::clamp(value, 0.0, 100.0));
+		}
+	};
+	for (size_t i = 0; i < FDINFO_UTIL_CATEGORIES.size(); ++i) {
+		if (sums[i]) {
+			fill(FDINFO_UTIL_CATEGORIES[i].series, *sums[i]);
+		}
+	}
+
+	// ALL: highest engine util across the categories that reported. Real sums are >= 0, so
+	// the -1.0 projection for an absent category can never win.
+	const auto busiest = std::ranges::max_element(sums, {}, [](const auto &s) { return s.value_or(-1.0); });
+	if (busiest->has_value()) {
+		fill(&DeviceMetrics::gpuUtilPerTile, **busiest);
+	}
+}
+
+/**
+ * @brief Build one ProcessUtilEntry per PID visible via fdinfo and/or Level Zero.
+ *
+ * fdinfo is the primary source because process::getState() reports
+ * ZE_RESULT_ERROR_UNSUPPORTED_FEATURE on the sysman-only path (hal/core/process.cpp).
+ * PIDs only Level Zero saw get disengaged util fields, which render as N/A.
+ *
+ * @param utilMap     Per-process engine utilisation from fdinfo::delta(), self PID excluded.
+ * @param processList Level Zero process list, empty when unavailable/unsupported.
+ * @param selfPid     Caller's own PID, excluded from @p processList.
+ */
+std::vector<ProcessUtilEntry> cmdStats::buildProcessUtilEntries(const fdinfo::PidUtilMap &utilMap,
+																const std::vector<zes_process_state_t> &processList,
+																uint32_t selfPid)
+{
+	const auto makeEntry = [](uint32_t pid, const ProcUtil &util) {
+		ProcessUtilEntry entry;
+		entry.pid = pid;
+		entry.name = GETPROCESSNAME(pid);
+		if (const size_t pos = entry.name.find('\0'); pos != std::string::npos) {
+			entry.name.resize(pos);
+		}
+		if (const size_t pos = entry.name.rfind('/'); pos != std::string::npos) {
+			entry.name = entry.name.substr(pos + 1);
+		}
+		entry.util = util;
+		return entry;
+	};
+
+	std::vector<ProcessUtilEntry> entries;
+	entries.reserve(utilMap.size() + processList.size());
+
+	for (const auto &[pid, engUtils] : utilMap) {
+		entries.push_back(makeEntry(pid, fdinfo::toProcUtil(engUtils)));
+	}
+
+	for (const auto &p : processList) {
+		if (p.processId == selfPid || utilMap.contains(p.processId)) {
+			continue;
+		}
+		entries.push_back(makeEntry(p.processId, ProcUtil{}));
+	}
+
+	return entries;
+}
+
+/**
+ * @brief Collect per-process engine utilisation via fdinfo (no root required).
+ *
+ * Closes the window opened by @p fdBefore, then publishes both the device-level fallback
+ * and the per-process entries.
+ *
+ * @param device   Device to sample.
+ * @param fdBefore Snapshot taken before the sampling loop.
+ * @param metrics  Utilization series and processUtils appended in-place.
+ * @return         The per-process delta and the measurable engine classes, for
+ *                 deriveEngineTrackersFromFdinfo().
+ */
+FdinfoUtilWindow cmdStats::collectProcessUtils(devInfo *device, const std::vector<fdinfo::ProcessSnapshot> &fdBefore,
+											   DeviceMetrics &metrics)
+{
+	TRACING();
+	const uint32_t selfPid = getCurrentProcessId();
+	const auto fdAfter = fdinfo::capture(devPciAddr(*device));
+	FdinfoUtilWindow window{.utilMap = fdinfo::delta(fdBefore, fdAfter), .measurable = {}};
+	auto &utilMap = window.utilMap;
+	// Every client's fdinfo lists each engine class the device has, busy or not, so the
+	// classes in the whole window - this process's own context included - are the ones
+	// fdinfo can measure here. Collected before the exclusion below for that reason.
+	for (const auto &engUtils : std::views::values(utilMap)) {
+		for (const auto &key : std::views::keys(engUtils)) {
+			window.measurable.insert(key);
+		}
+	}
+	// Before aggregating: fdinfo sees xpu-smi's own probe context, which would otherwise
+	// leak this command's GPU activity into the fallback and every derived tracker.
+	utilMap.erase(selfPid);
+
+	applyFdinfoUtilFallback(utilMap, window.measurable, metrics);
+
+	std::vector<zes_process_state_t> processList;
+	auto *ps = device->dev->getProcess();
+	if (ps == nullptr) {
+		DBG("Process handler not available for process utilization.\n");
+	} else if (ps->getState(device->zesDeviceHdl, &processList) != ZE_RESULT_SUCCESS) {
+		DBG("Failed to get process list for process utilization.\n");
+		processList.clear();
+	}
+
+	auto entries = buildProcessUtilEntries(utilMap, processList, selfPid);
+	metrics.processUtils.insert(metrics.processUtils.end(), std::make_move_iterator(entries.begin()),
+								std::make_move_iterator(entries.end()));
+
+	return window;
+}
+
+/**
+ * @brief Replace sample-less engine trackers with one aggregated fdinfo tracker.
+ *
+ * Only one tracker is produced: fdinfo::capture() normalises "ccs0"/"ccs1" to the category
+ * key "ccs", so per-instance attribution is not recoverable. Gated on @c samples rather than
+ * on @p trackers itself because L0 enumerates handles without CAP_PERFMON but
+ * getEngineActivityByType() then fails silently — the very case this covers.
+ *
+ * @param utilMap    Per-process engine utilisation from fdinfo::delta().
+ * @param measurable Engine classes fdinfo reported for the device in the same window.
+ * @param trackers   Replaced in-place when it holds no readable sample.
+ * @param engineKey  Normalised fdinfo engine key to sum, e.g. "ccs".
+ */
+void cmdStats::deriveEngineTrackersFromFdinfo(const fdinfo::PidUtilMap &utilMap, const FdinfoEngineKeys &measurable,
+											  std::vector<EngineInstanceTracker> &trackers, std::string_view engineKey)
+{
+	if (std::ranges::any_of(trackers, [](const EngineInstanceTracker &t) { return !t.samples.empty(); })) {
+		return;
+	}
+	trackers.clear();
+
+	// A class fdinfo measures on this device starts at 0, so an idle one reads 0% as it does
+	// on the sysman path rather than N/A.
+	std::optional<double> total;
+	if (measurable.contains(engineKey)) {
+		total = 0.0;
+	}
+	for (const auto &engUtils : std::views::values(utilMap)) {
+		if (const auto it = engUtils.find(std::string{engineKey}); it != engUtils.end()) {
+			total = total.value_or(0.0) + static_cast<double>(it->second);
+		}
+	}
+	if (!total) {
+		return;
+	}
+
+	trackers.push_back({.engineIndex = 0, .baseline = {}, .samples = {std::clamp(*total, 0.0, 100.0)}});
+}
+
 /**
  * @brief Collect device statistics (engine utilizations + static memory)
  *
@@ -1207,9 +1459,20 @@ ze_result_t cmdStats::collectDeviceStats(devInfo *device, size_t sampleCount, st
 	captureEnginesByType(engineGroup, ZES_ENGINE_GROUP_COPY_SINGLE, copyEngines);
 	captureEnginesByType(engineGroup, ZES_ENGINE_GROUP_MEDIA_ENHANCEMENT_SINGLE, mediaEmEngines);
 
+	auto fdBefore = fdinfo::capture(devPciAddr(*device));
+
 	const size_t actualSampleCount = std::max<size_t>(sampleCount, 2);
 	for (size_t i = 0; i < actualSampleCount; ++i) {
-		std::this_thread::sleep_for(sampleInterval);
+		// The EU collector blocks for its own fixed window, so it runs across the interval sleep
+		// rather than after it: a sample then costs max(interval, EU window), not both. It only
+		// writes metrics.euMetrics, which nothing else in this loop touches.
+		std::future<ze_result_t> euFut;
+		if (collectEuMetrics) {
+			euFut = std::async(std::launch::async, collectEuMetricsPerTile, dev->getMetric(), dev->getDeviceHandle(),
+							   dev->getDriverHandle(), std::ref(metrics.euMetrics));
+		}
+
+		xpum::watchdog::sleepFor(sampleInterval);
 
 		auto sampleEngineType = [&](zes_engine_group_t engineType, std::vector<EngineInstanceTracker> &trackers) {
 			if (engineGroup == nullptr || trackers.empty()) {
@@ -1269,9 +1532,9 @@ ze_result_t cmdStats::collectDeviceStats(devInfo *device, size_t sampleCount, st
 			collectFdinfoUtil(device, fdinfoBaseline, metrics);
 		}
 
-		if (collectEuMetrics) {
-			auto *metricHandler = dev->getMetric();
-			collectEuMetricsPerTile(metricHandler, dev->getDeviceHandle(), dev->getDriverHandle(), metrics.euMetrics);
+		if (euFut.valid()) {
+			// A failed collection is logged inside and leaves the EU rows empty, as before.
+			static_cast<void>(euFut.get());
 		}
 	}
 
@@ -1313,6 +1576,16 @@ ze_result_t cmdStats::collectDeviceStats(devInfo *device, size_t sampleCount, st
 			}
 		}
 	}
+
+	const auto fdWindow = collectProcessUtils(device, fdBefore, metrics);
+	deriveEngineTrackersFromFdinfo(fdWindow.utilMap, fdWindow.measurable, computeEngines, "ccs");
+	deriveEngineTrackersFromFdinfo(fdWindow.utilMap, fdWindow.measurable, renderEngines, "rcs");
+	deriveEngineTrackersFromFdinfo(fdWindow.utilMap, fdWindow.measurable, copyEngines, "bcs");
+	deriveEngineTrackersFromFdinfo(fdWindow.utilMap, fdWindow.measurable, decoderEngines, "vcs");
+	// fdinfo has no counter distinct from "vecs" for encode; attributing it here would
+	// duplicate the enhancement figure below rather than report real encode activity, so
+	// encoderEngines is left without an fdinfo fallback and reports N/A when L0 can't enumerate it.
+	deriveEngineTrackersFromFdinfo(fdWindow.utilMap, fdWindow.measurable, mediaEmEngines, "vecs");
 
 	auto endTime = std::chrono::system_clock::now();
 	metrics.endTimeIso = formatIso8601Timestamp(endTime);
@@ -1642,6 +1915,22 @@ ze_result_t cmdStats::collectDeviceStats(devInfo *device, size_t sampleCount, st
 		}
 	}
 
+	if (!metrics.processUtils.empty()) {
+		auto &procsJson = deviceJson["processes"];
+		procsJson = nlohmann::ordered_json::array();
+		for (const auto &pu : metrics.processUtils) {
+			nlohmann::ordered_json procJson;
+			procJson["pid"] = pu.pid;
+			procJson["name"] = pu.name;
+			for (const auto &f : PROC_UTIL_FIELDS) {
+				const auto value = pu.util.*f.field;
+				procJson[std::string{f.jsonKey}] =
+					value ? nlohmann::ordered_json(*value) : nlohmann::ordered_json(nullptr);
+			}
+			procsJson.push_back(procJson);
+		}
+	}
+
 	if (collectRas) {
 		ze_result_t rasResult = collectRasCounters(device, metrics);
 		if (rasResult == ZE_RESULT_SUCCESS && !metrics.rasCounters.empty()) {
@@ -1814,6 +2103,8 @@ void StatsTextPrinter::printDeviceTable(const nlohmann::ordered_json &deviceJson
 		uint32_t offlineCount = deviceJson["offline_page_count"].get<uint32_t>();
 		table.addRow("Offline Memory Pages", std::to_string(offlineCount));
 	}
+
+	addProcessUtilRows(table, deviceJson);
 
 	addMetricRow(table, deviceJson, "PCIe Read (kB/s)", {"pcie", "read_kbps"});
 
@@ -2205,6 +2496,35 @@ void StatsTextPrinter::addRasCounterRows(TableBuilder &table, const nlohmann::or
 		}
 		addRasCategory(categoryInfo.name, "correctable");
 		addRasCategory(categoryInfo.name, "uncorrectable");
+	}
+}
+
+void StatsTextPrinter::addProcessUtilRows(TableBuilder &table, const nlohmann::ordered_json &deviceJson)
+{
+	TRACING();
+	if (!deviceJson.contains("processes") || deviceJson["processes"].empty()) {
+		return;
+	}
+
+	bool firstRow = true;
+	for (const auto &proc : deviceJson["processes"]) {
+		std::string utils;
+		for (const auto &[jsonKey, label, field] : PROC_UTIL_FIELDS) {
+			const std::string key{jsonKey};
+			if (!proc.contains(key) || proc[key].is_null()) {
+				continue;
+			}
+			if (!utils.empty()) {
+				utils += ", ";
+			}
+			utils += xpum::compat::format("{}: {:.1f}", label, proc[key].get<float>());
+		}
+
+		// Label only the first row so consecutive PIDs read as one block in the table.
+		table.addRow(firstRow ? "Process Util (%)" : "",
+					 xpum::compat::format("PID {} ({}): {}", proc.value("pid", 0U), proc.value("name", std::string{}),
+										  utils.empty() ? std::string{"N/A"} : utils));
+		firstRow = false;
 	}
 }
 
@@ -2661,14 +2981,27 @@ int cmdStats::run(arg_struct *args)
 		return runListOfflinePages(deviceList, printer.get(), statsCmds[STATS_JSON].enabled);
 	}
 
+	// Each device samples over its own window; running them concurrently makes the command take
+	// one device's sampling time instead of the sum. Results are printed in device order.
+	const bool collectRas = statsCmds[STATS_RAS].enabled;
+	const bool collectEu = statsCmds[STATS_EU].enabled;
+	std::vector<std::future<DeviceStatsResult>> deviceFutures;
+	deviceFutures.reserve(deviceList.size());
 	for (auto &device : deviceList) {
-		DeviceMetrics metrics;
-		nlohmann::ordered_json deviceJson;
+		deviceFutures.push_back(std::async(
+			std::launch::async, [&device, sampleCount, sampleInterval, collectRas, collectEu]() -> DeviceStatsResult {
+				DeviceMetrics metrics;
+				DeviceStatsResult out;
+				out.status = collectDeviceStats(&device, sampleCount, sampleInterval, metrics, out.deviceJson,
+												collectRas, collectEu);
+				return out;
+			}));
+	}
 
-		result = collectDeviceStats(&device, sampleCount, sampleInterval, metrics, deviceJson,
-									statsCmds[STATS_RAS].enabled, statsCmds[STATS_EU].enabled);
-		if (result != ZE_RESULT_SUCCESS) {
-			ERR("Failed to collect stats for device {}.\n", device.index);
+	for (std::size_t i = 0; i < deviceList.size(); ++i) {
+		auto [status, deviceJson] = deviceFutures[i].get();
+		if (status != ZE_RESULT_SUCCESS) {
+			ERR("Failed to collect stats for device {}.\n", deviceList[i].index);
 			continue;
 		}
 

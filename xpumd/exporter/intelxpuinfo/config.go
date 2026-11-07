@@ -20,7 +20,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 
 	"github.com/intel/xpumanager/xpumd/common"
-	pb "github.com/intel/xpumanager/xpumd/exporter/intelxpuinfo/api/deviceinfo/v1alpha1"
+	pb "github.com/intel/xpumanager/xpumd/exporter/intelxpuinfo/api/deviceinfo/v1alpha2"
 )
 
 // severityNames maps configuration severity name strings to pb.SeverityLevel
@@ -73,7 +73,8 @@ type HwStatusMapping struct {
 	// output, not just the one with the highest severity for each health domain.
 	ShowAllStates bool `mapstructure:"show_all_states"`
 
-	// healthDomainTmpl is compiled from HealthDomain during Validate.
+	// healthDomainTmpl is compiled from HealthDomain during Validate. Nil if
+	// HealthDomain is a plain literal (no template rendering needed).
 	healthDomainTmpl *template.Template
 }
 
@@ -82,6 +83,9 @@ type HwStatusMapping struct {
 // variables (dots in names replaced by underscores). When no template is
 // configured the default "{hw.type}[.{hw.sensor_location}]" is used.
 func (m *HwStatusMapping) healthDomainFor(attrs pcommon.Map) (string, error) {
+	if m.healthDomainTmpl == nil {
+		return m.HealthDomain, nil
+	}
 	data := make(map[string]string, attrs.Len())
 	attrs.Range(func(k string, v pcommon.Value) bool {
 		data[strings.ReplaceAll(k, ".", "_")] = v.Str()
@@ -118,20 +122,30 @@ func (cfg *Config) Validate() error {
 	if cfg.NetAddr.Transport != confignet.TransportTypeUnix {
 		return fmt.Errorf("unsupported transport type: %q, only %q is supported", cfg.NetAddr.Transport, confignet.TransportTypeUnix)
 	}
+	// No auth or middleware extensions are available, so these would fail at start.
+	if cfg.Auth.HasValue() {
+		return fmt.Errorf("auth is not supported for local gRPC")
+	}
+	if len(cfg.Middlewares) > 0 {
+		return fmt.Errorf("middlewares are not supported for local gRPC")
+	}
 	return nil
 }
 
 // Validate checks if the mapping is valid and compiles derived fields.
 func (m *HwStatusMapping) Validate() error {
+	m.healthDomainTmpl = nil
 	if m.HealthDomain == "" {
 		return fmt.Errorf("health_domain must be specified")
 
 	}
-	tmpl, err := template.New("health_domain").Option("missingkey=zero").Parse(m.HealthDomain)
-	if err != nil {
-		return fmt.Errorf("invalid health_domain template: %w", err)
+	if strings.Contains(m.HealthDomain, "{{") {
+		tmpl, err := template.New("health_domain").Option("missingkey=zero").Parse(m.HealthDomain)
+		if err != nil {
+			return fmt.Errorf("invalid health_domain template: %w", err)
+		}
+		m.healthDomainTmpl = tmpl
 	}
-	m.healthDomainTmpl = tmpl
 
 	for hwState, sm := range m.StateMapping {
 		if err := sm.validate(hwState); err != nil {

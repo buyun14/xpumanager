@@ -87,24 +87,45 @@ constexpr auto FREE = QueryMetric{
 		return ZE_RESULT_SUCCESS;
 	}};
 
-constexpr auto READ_BANDWIDTH =
+constexpr auto RESERVED =
 	QueryMetric{// NOLINT(readability-identifier-naming)
-				.name = "memory.read.bandwidth",
-				.unit = "kB/s",
-				.description = "GPU memory read bandwidth (Intel-only; dump -m 6)",
+				.name = "memory.reserved",
+				.unit = "MiB",
+				.description = "GPU memory the driver keeps back: installed size minus memory.total. Included in "
+							   "memory.used",
 				.source = MetricSource::Live,
 				.groups = MetricGroup::MEMORY,
-				.inputs = MetricInput::MEMBW,
-				.getter = [](devInfo & /*d*/, MetricValue &out, const MetricCache &cache) -> ze_result_t {
-					if (!cache.memAvail || cache.memAfter.ts <= cache.memBefore.ts) {
-						out = "N/A";
-						return ZE_RESULT_SUCCESS;
+				.getter = [](devInfo &d, MetricValue &out, const MetricCache &) -> ze_result_t {
+					auto *mem = d.dev->getMemory();
+					if (mem == nullptr) {
+						return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
 					}
-					const auto dt = static_cast<double>(cache.memAfter.ts - cache.memBefore.ts);
-					const auto rd = static_cast<double>(cache.memAfter.read - cache.memBefore.read);
-					out = xpum::compat::format("{}", 1000000.0 * rd / dt / 1024.0);
-					return ZE_RESULT_SUCCESS;
+					uint64_t bytes = 0;
+					const auto r = mem->getMemoryReserved(&bytes);
+					if (r == ZE_RESULT_SUCCESS) {
+						out = xpum::compat::format("{}", static_cast<double>(bytes) / (1024.0 * 1024.0));
+					}
+					return r;
 				}};
+
+constexpr auto READ_BANDWIDTH = QueryMetric{
+	// NOLINT(readability-identifier-naming)
+	.name = "memory.read.bandwidth",
+	.unit = "kB/s",
+	.description = "GPU memory read bandwidth (Intel-only; dump -m 6)",
+	.source = MetricSource::Live,
+	.groups = MetricGroup::MEMORY,
+	.inputs = MetricInput::MEMBW,
+	.getter = [](devInfo & /*d*/, MetricValue &out, const MetricCache &cache) -> ze_result_t {
+		if (!cache.memAvail || cache.memAfter.ts <= cache.memBefore.ts || cache.memAfter.read < cache.memBefore.read) {
+			out = "N/A";
+			return ZE_RESULT_SUCCESS;
+		}
+		const auto dt = static_cast<double>(cache.memAfter.ts - cache.memBefore.ts);
+		const auto rd = static_cast<double>(cache.memAfter.read - cache.memBefore.read);
+		out = xpum::compat::format("{}", 1000000.0 * rd / dt / 1024.0);
+		return ZE_RESULT_SUCCESS;
+	}};
 
 constexpr auto WRITE_BANDWIDTH =
 	QueryMetric{// NOLINT(readability-identifier-naming)
@@ -115,7 +136,8 @@ constexpr auto WRITE_BANDWIDTH =
 				.groups = MetricGroup::MEMORY,
 				.inputs = MetricInput::MEMBW,
 				.getter = [](devInfo & /*d*/, MetricValue &out, const MetricCache &cache) -> ze_result_t {
-					if (!cache.memAvail || cache.memAfter.ts <= cache.memBefore.ts) {
+					if (!cache.memAvail || cache.memAfter.ts <= cache.memBefore.ts ||
+						cache.memAfter.write < cache.memBefore.write) {
 						out = "N/A";
 						return ZE_RESULT_SUCCESS;
 					}
@@ -134,7 +156,8 @@ constexpr auto BANDWIDTH_UTILIZATION = QueryMetric{
 	.groups = MetricGroup::MEMORY,
 	.inputs = MetricInput::MEMBW,
 	.getter = [](devInfo & /*d*/, MetricValue &out, const MetricCache &cache) -> ze_result_t {
-		if (!cache.memAvail || cache.memAfter.ts <= cache.memBefore.ts || cache.memMaxBandwidth == 0) {
+		if (!cache.memAvail || cache.memAfter.ts <= cache.memBefore.ts || cache.memMaxBandwidth == 0 ||
+			cache.memAfter.read < cache.memBefore.read || cache.memAfter.write < cache.memBefore.write) {
 			out = "N/A";
 			return ZE_RESULT_SUCCESS;
 		}
@@ -147,7 +170,7 @@ constexpr auto BANDWIDTH_UTILIZATION = QueryMetric{
 	}};
 
 constexpr auto ALL =
-	std::to_array<QueryMetric>({total, used, FREE, READ_BANDWIDTH, WRITE_BANDWIDTH, BANDWIDTH_UTILIZATION});
+	std::to_array<QueryMetric>({total, RESERVED, used, FREE, READ_BANDWIDTH, WRITE_BANDWIDTH, BANDWIDTH_UTILIZATION});
 
 } // namespace
 

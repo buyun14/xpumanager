@@ -50,6 +50,61 @@ Number of GPU errors. Correctable `error.type` error metrics are reported only w
 | error.type | Error type. | Str: ``correctable``, ``uncorrectable`` | Recommended | - |
 | error.category | Error category. | Any Str | Recommended | - |
 
+### hw.fan.speed
+
+GPU fan speed.
+
+| Unit | Metric Type | Value Type | Stability |
+| ---- | ----------- | ---------- | --------- |
+| {rev}/min | Gauge | Int | Development |
+
+#### Attributes
+
+| Name | Description | Values | Requirement Level | Semantic Convention |
+| ---- | ----------- | ------ | ----------------- | ------------------- |
+| hw.id | Unique identifier for the hardware component. | Any Str | Recommended | - |
+| hw.name | An easily-recognizable name for the hardware component. | Any Str | Recommended | - |
+| pci.bdf | PCI BDF (`<domain>:<bus>:<device>.<function>`) for the device. | Any Str | Recommended | - |
+| com.intel.subdevice_id | Sub-device ID of the hardware component. | Any Str | Recommended | - |
+| hw.sensor_location | Location of the sensor. | Any Str | Recommended | - |
+
+### hw.fan.speed.limit
+
+GPU fan speed limit.
+
+| Unit | Metric Type | Value Type | Stability |
+| ---- | ----------- | ---------- | --------- |
+| {rev}/min | Gauge | Int | Development |
+
+#### Attributes
+
+| Name | Description | Values | Requirement Level | Semantic Convention |
+| ---- | ----------- | ------ | ----------------- | ------------------- |
+| hw.id | Unique identifier for the hardware component. | Any Str | Recommended | - |
+| hw.name | An easily-recognizable name for the hardware component. | Any Str | Recommended | - |
+| pci.bdf | PCI BDF (`<domain>:<bus>:<device>.<function>`) for the device. | Any Str | Recommended | - |
+| com.intel.subdevice_id | Sub-device ID of the hardware component. | Any Str | Recommended | - |
+| hw.sensor_location | Location of the sensor. | Any Str | Recommended | - |
+| hw.limit_type | Type of limit. | Any Str | Recommended | - |
+
+### hw.fan.speed_ratio
+
+GPU fan speed ratio. Derived from `hw.fan.speed` + `hw.fan.speed.limit`.
+
+| Unit | Metric Type | Value Type | Stability |
+| ---- | ----------- | ---------- | --------- |
+| 1 | Gauge | Double | Development |
+
+#### Attributes
+
+| Name | Description | Values | Requirement Level | Semantic Convention |
+| ---- | ----------- | ------ | ----------------- | ------------------- |
+| hw.id | Unique identifier for the hardware component. | Any Str | Recommended | - |
+| hw.name | An easily-recognizable name for the hardware component. | Any Str | Recommended | - |
+| pci.bdf | PCI BDF (`<domain>:<bus>:<device>.<function>`) for the device. | Any Str | Recommended | - |
+| com.intel.subdevice_id | Sub-device ID of the hardware component. | Any Str | Recommended | - |
+| hw.sensor_location | Location of the sensor. | Any Str | Recommended | - |
+
 ### hw.frequency
 
 Operating frequency of the hardware component.
@@ -501,3 +556,23 @@ Temperature of the hardware component in degrees Celsius.
 | com.intel.subdevice_id | Sub-device ID of the hardware component. | Any Str | Recommended | - |
 | hw.sensor_location | Location of the sensor. | Any Str | Recommended | - |
 | statistic | Statistic type for the metric. | Str: ``min``, ``max`` | Recommended | - |
+
+## Internal Telemetry
+
+The following telemetry is emitted by this component.
+
+### otelcol_sysman_sampler_interval_usage
+
+Portion of the sampling interval used on one sampler tick, measured from the tick to the completion of polling the aggregated metrics of all devices. Values above 1 mean that the next sampling deadline was delayed or missed.
+
+| Unit | Metric Type | Value Type | Stability |
+| ---- | ----------- | ---------- | --------- |
+| 1 | Histogram | Double | Development |
+
+### otelcol_sysman_sampler_missed_deadlines
+
+Number of `sampling_interval` deadlines missed for aggregated metrics. Unlike dropped samples (`hw.frequency.samples`), these samples were never queried.
+
+| Unit | Metric Type | Value Type | Monotonic | Stability |
+| ---- | ----------- | ---------- | --------- | --------- |
+| {deadline} | Sum | Int | true | Development |

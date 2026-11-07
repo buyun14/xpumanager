@@ -26,7 +26,8 @@
 // INFO(fmt, ...) for log-level gating. We don't use doctest INFO in this file.
 #undef INFO
 
-#include "debug.h"
+// From the repository root like the headers above, so it resolves without hal/core on the include path
+#include "hal/core/debug.h"
 #include "utility/logger/async_sink.h"
 
 #include <atomic>
@@ -91,13 +92,22 @@ public:
 struct LoggerGuard
 {
 	std::shared_ptr<Sink> savedSink = Logger::instance().getSink();
+	std::shared_ptr<Sink> savedPrintSink = Logger::instance().getPrintSink();
 	LogLevel savedLevel = getDbgLvl();
 
+	LoggerGuard() = default;
 	~LoggerGuard()
 	{
-		Logger::instance().setSink(savedSink);
+		// Restored separately: setSink() would put the diagnostic sink in place of the PRINT one.
+		Logger::instance().setLogSink(savedSink);
+		Logger::instance().setPrintSink(savedPrintSink);
 		setDbgLvl(savedLevel);
 	}
+	// A copy would restore the saved state a second time
+	LoggerGuard(const LoggerGuard &) = delete;
+	LoggerGuard &operator=(const LoggerGuard &) = delete;
+	LoggerGuard(LoggerGuard &&) = delete;
+	LoggerGuard &operator=(LoggerGuard &&) = delete;
 };
 
 // ── OStreamSink ───────────────────────────────────────────────────────────────
@@ -219,6 +229,39 @@ TEST_CASE("Logger: getSink round-trips the same object")
 	CHECK(Logger::instance().getSink() == cap);
 }
 
+TEST_CASE("Logger: setLogSink replaces only the diagnostic sink")
+{
+	LoggerGuard const guard;
+	auto printBefore = Logger::instance().getPrintSink();
+	auto cap = std::make_shared<CaptureSink>();
+	Logger::instance().setLogSink(cap);
+	CHECK(Logger::instance().getSink() == cap);
+	CHECK(Logger::instance().getPrintSink() == printBefore);
+}
+
+TEST_CASE("Logger: setPrintSink replaces only the PRINT sink")
+{
+	LoggerGuard const guard;
+	auto logBefore = Logger::instance().getSink();
+	auto cap = std::make_shared<CaptureSink>();
+	Logger::instance().setPrintSink(cap);
+	CHECK(Logger::instance().getPrintSink() == cap);
+	CHECK(Logger::instance().getSink() == logBefore);
+
+	PRINT("printed\n");
+	CHECK(cap->str().find("printed") != std::string::npos);
+}
+
+TEST_CASE("Logger: setLogSink(nullptr) and setPrintSink(nullptr) reset to non-null defaults")
+{
+	LoggerGuard const guard;
+	Logger::instance().setLogSink(nullptr);
+	Logger::instance().setPrintSink(nullptr);
+	CHECK(Logger::instance().getSink() != nullptr);
+	CHECK(Logger::instance().getPrintSink() != nullptr);
+	CHECK(Logger::instance().getSink() != Logger::instance().getPrintSink());
+}
+
 // ── Level gating ──────────────────────────────────────────────────────────────
 
 TEST_CASE("Logger: PRINT always emits regardless of dbgLvl")
@@ -309,6 +352,154 @@ TEST_CASE("Logger: DBG emits at dbgLvl >= DBG")
 	DBG("visible dbg\n");
 
 	CHECK(cap->str().find("visible dbg") != std::string::npos);
+}
+
+// -- Banner -------------------------------------------------------------------
+
+namespace {
+
+/**
+ * Clears the banner, then (via LoggerGuard's destructor, which runs after this
+ * body) restores the sink and level, so no banner leaks into later cases.
+ */
+struct BannerGuard
+{
+	LoggerGuard logger;
+
+	BannerGuard() = default;
+	BannerGuard(const BannerGuard &) = delete;
+	BannerGuard &operator=(const BannerGuard &) = delete;
+	BannerGuard(BannerGuard &&) = delete;
+	BannerGuard &operator=(BannerGuard &&) = delete;
+	~BannerGuard() { Logger::instance().setBanner({}); }
+};
+
+/// Number of non-overlapping occurrences of @p needle in @p haystack.
+[[nodiscard]] std::size_t countOf(const std::string &haystack, std::string_view needle)
+{
+	std::size_t n = 0;
+	for (std::size_t pos = haystack.find(needle); pos != std::string::npos;
+		 pos = haystack.find(needle, pos + needle.size())) {
+		++n;
+	}
+	return n;
+}
+
+} // namespace
+
+TEST_CASE("Banner: written once, ahead of the first DBG record")
+{
+	if constexpr (!detail::DEBUG_ENABLED)
+		return;
+	BannerGuard const guard;
+	setDbgLvl(LogLevel::DBG);
+	Logger::instance().setBanner("BANNER\n");
+	auto cap = std::make_shared<CaptureSink>();
+	Logger::instance().setSink(cap);
+
+	DBG("first\n");
+	DBG("second\n");
+
+	CHECK(cap->str().starts_with("BANNER\n"));
+	CHECK(countOf(cap->str(), "BANNER") == 1);
+}
+
+TEST_CASE("Banner: not written below DBG")
+{
+	BannerGuard const guard;
+	setDbgLvl(LogLevel::INFO);
+	Logger::instance().setBanner("BANNER\n");
+	auto cap = std::make_shared<CaptureSink>();
+	Logger::instance().setSink(cap);
+
+	INFO("info\n");
+	ERR("err\n");
+
+	CHECK(cap->str().find("BANNER") == std::string::npos);
+}
+
+TEST_CASE("Banner: still written when the level is raised after the first record")
+{
+	if constexpr (!detail::DEBUG_ENABLED)
+		return;
+	BannerGuard const guard;
+	setDbgLvl(LogLevel::INFO);
+	Logger::instance().setBanner("BANNER\n");
+	auto cap = std::make_shared<CaptureSink>();
+	Logger::instance().setSink(cap);
+
+	INFO("before\n");
+	setDbgLvl(LogLevel::DBG);
+	DBG("after\n");
+
+	const std::string &out = cap->str();
+	CHECK(countOf(out, "BANNER") == 1);
+	CHECK(out.find("before") < out.find("BANNER"));
+	CHECK(out.find("BANNER") < out.find("after"));
+}
+
+TEST_CASE("Banner: installing a new sink re-arms it")
+{
+	if constexpr (!detail::DEBUG_ENABLED)
+		return;
+	BannerGuard const guard;
+	setDbgLvl(LogLevel::DBG);
+	Logger::instance().setBanner("BANNER\n");
+	auto first = std::make_shared<CaptureSink>();
+	Logger::instance().setSink(first);
+	DBG("to first\n");
+
+	auto second = std::make_shared<CaptureSink>();
+	Logger::instance().setSink(second);
+	DBG("to second\n");
+
+	CHECK(second->str().starts_with("BANNER\n"));
+	CHECK(countOf(first->str(), "BANNER") == 1);
+}
+
+TEST_CASE("Banner: an empty banner writes nothing")
+{
+	if constexpr (!detail::DEBUG_ENABLED)
+		return;
+	BannerGuard const guard;
+	setDbgLvl(LogLevel::DBG);
+	Logger::instance().setBanner({});
+	auto cap = std::make_shared<CaptureSink>();
+	Logger::instance().setSink(cap);
+
+	DBG("only\n");
+
+	CHECK(cap->str() == "[DBG] only\n");
+}
+
+TEST_CASE("Banner: NO_PRINT suppresses it")
+{
+	BannerGuard const guard;
+	setDbgLvl(LogLevel::NO_PRINT);
+	Logger::instance().setBanner("BANNER\n");
+	auto cap = std::make_shared<CaptureSink>();
+	Logger::instance().setSink(cap);
+
+	ERR("err\n");
+
+	CHECK(cap->str().empty());
+}
+
+TEST_CASE("Banner: PRINT never triggers it")
+{
+	if constexpr (!detail::DEBUG_ENABLED)
+		return;
+	BannerGuard const guard;
+	setDbgLvl(LogLevel::DBG);
+	Logger::instance().setBanner("BANNER\n");
+	auto cap = std::make_shared<CaptureSink>(); // setSink also routes PRINT here
+	Logger::instance().setSink(cap);
+
+	PRINT("x\n");
+	CHECK(cap->str() == "x\n");
+
+	DBG("dbg\n");
+	CHECK(countOf(cap->str(), "BANNER") == 1);
 }
 
 // ── ERR source location ───────────────────────────────────────────────────────

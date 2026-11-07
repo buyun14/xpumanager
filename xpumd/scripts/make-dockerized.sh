@@ -10,6 +10,10 @@
 
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 
+if [ -z "$XPUMD_VERSION" ]; then
+	XPUMD_VERSION=$(git -C "$SCRIPT_DIR/.." describe --tags --dirty --always | tr / -)
+fi
+
 # checksum file for L0 loader DEB packages
 if [ "$BACKEND" = "src" ]; then
 	CHECKSUMS=checksums-loader-src.txt
@@ -43,7 +47,7 @@ COPY $CHECKSUMS .
 
 # Unzip needed for installing protoc, libyaml-dev/libcyaml-dev/jq/clang-format for generating Go bindings
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        unzip libyaml-dev libcyaml-dev jq clang-format codespell shellcheck && \
+        unzip libyaml-dev libcyaml-dev jq clang-format codespell shellcheck yamllint && \
     curl -LO ${L0_BASE_URL}/v${LEVEL_ZERO_VERSION}/libze1_${LEVEL_ZERO_VERSION}+u24.04_amd64.deb \
          -LO ${L0_BASE_URL}/v${LEVEL_ZERO_VERSION}/libze-dev_${LEVEL_ZERO_VERSION}+u24.04_amd64.deb && \
     if ! sha256sum --check $CHECKSUMS ; then \
@@ -57,6 +61,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dpkg -i ./*.deb && \
     rm -f ./*.deb && rm -rf /var/lib/apt/lists/*
 EOF
+
+SRC_DIR="$(realpath "${SCRIPT_DIR}/../..")"
 
 if [ "$(ps -p 1 -o comm=)" = "systemd" ]; then
     USER="$(id -u):$(id -g)"
@@ -73,10 +79,12 @@ if [ -n "${GOMODCACHE}" ] && [ -d "${GOMODCACHE}" ]; then
 fi
 
 docker run --rm \
+    --env "XPUMD_VERSION=$XPUMD_VERSION" \
     --user "${USER}" \
+    --cap-drop ALL \
     "${GOMODCACHE_MOUNT[@]}" \
     -e HOME=/go \
-    -v "${SCRIPT_DIR}/../..:/go/src" \
+    -v "${SRC_DIR}:/go/src" \
     -w /go/src \
     "${IMAGE_TAG}" \
     /bin/sh -c "make -C xpumd $*"

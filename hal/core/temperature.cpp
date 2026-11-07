@@ -5,6 +5,7 @@
  */
 
 #include "temperature.h"
+#include <algorithm>
 #include "temperature_ext.h"
 #include "debug.h"
 #include <cmath>
@@ -202,7 +203,29 @@ uint64_t temperature::getThrottleCoreTemperature(uint32_t pciDeviceId)
  */
 uint64_t temperature::getShutdownCoreTemperature(uint32_t pciDeviceId)
 {
-	return thresholds->getShutdownCoreTemperature(pciDeviceId, defaultCoreShutdownThreshold);
+	return thresholds->getShutdownCoreTemperature(
+		pciDeviceId, cappedByDriverMax(defaultCoreShutdownThreshold, ZES_TEMP_SENSORS_GPU));
+}
+
+/**
+ * @brief A default threshold, lowered to the maximum the driver reports for the sensor type.
+ *
+ * The defaults are generic, and a driver can know its device stops sooner: CRI reports 125 C,
+ * below the 130 C GPU default. A threshold configured for the device is not affected.
+ *
+ * @param[in] defaultValue The xpu-smi default, in Celsius.
+ * @param[in] type         The sensor type the threshold is for.
+ *
+ * @retval threshold The smaller of @p defaultValue and the driver's maximum, or @p defaultValue
+ *                   when the driver reports no maximum.
+ */
+uint64_t temperature::cappedByDriverMax(uint64_t defaultValue, zes_temp_sensors_t type)
+{
+	double driverMax = 0.0;
+	if (getMaxTemp(type, &driverMax) != ZE_RESULT_SUCCESS) {
+		return defaultValue;
+	}
+	return std::min(defaultValue, static_cast<uint64_t>(driverMax));
 }
 
 /**
@@ -217,7 +240,8 @@ uint64_t temperature::getShutdownCoreTemperature(uint32_t pciDeviceId)
  */
 uint64_t temperature::getShutdownMemoryTemperature(uint32_t pciDeviceId)
 {
-	return thresholds->getShutdownMemoryTemperature(pciDeviceId, defaultMemoryShutdownThreshold);
+	return thresholds->getShutdownMemoryTemperature(
+		pciDeviceId, cappedByDriverMax(defaultMemoryShutdownThreshold, ZES_TEMP_SENSORS_MEMORY));
 }
 
 /**
@@ -233,8 +257,12 @@ uint64_t temperature::getShutdownMemoryTemperature(uint32_t pciDeviceId)
 ze_result_t temperature::enumTemperatureDomains(zes_device_handle_t device)
 {
 	ze_result_t result = zesDeviceEnumTemperatureSensors(device, &temperatureCount, nullptr);
-	if (result != ZE_RESULT_SUCCESS || temperatureCount == 0) {
+	if (result != ZE_RESULT_SUCCESS) {
 		ERR("Failed to enumerate temperature domains. 0x{:X} ({})\n", result, l0_error_to_string(result));
+		return result;
+	}
+	if (temperatureCount == 0) {
+		DBG("The device exposes no temperature sensors.\n");
 		return result;
 	}
 
@@ -379,6 +407,40 @@ ze_result_t temperature::getTemp(zes_temp_sensors_t type, double *temp)
 	}
 
 	return sensorFound ? ZE_RESULT_SUCCESS : ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+}
+
+/**
+ * @brief The highest temperature the driver says a sensor type can operate at.
+ *
+ * Takes the first sensor of @p type that reports one.
+ *
+ * @param[in]  type    The sensor type, e.g. ZES_TEMP_SENSORS_GPU.
+ * @param[out] maxTemp Receives the maximum in Celsius.
+ *
+ * @retval ZE_RESULT_SUCCESS                    @p maxTemp was written.
+ * @retval ZE_RESULT_ERROR_INVALID_NULL_POINTER @p maxTemp is null.
+ * @retval ZE_RESULT_ERROR_NOT_AVAILABLE       Sensors of @p type exist but report no maximum.
+ * @retval ZE_RESULT_ERROR_UNSUPPORTED_FEATURE  The device has no sensor of @p type.
+ */
+ze_result_t temperature::getMaxTemp(zes_temp_sensors_t type, double *maxTemp)
+{
+	if (maxTemp == nullptr) {
+		return ZE_RESULT_ERROR_INVALID_NULL_POINTER;
+	}
+	bool sensorFound = false;
+	for (uint32_t i = 0; i < temperatureCount; ++i) {
+		zes_temp_properties_t properties = {};
+		if (getProperties(temperatureHandles[i], &properties) != ZE_RESULT_SUCCESS || properties.type != type) {
+			continue;
+		}
+		sensorFound = true;
+		// A driver that does not know the maximum reports a negative value.
+		if (properties.maxTemperature > 0.0) {
+			*maxTemp = properties.maxTemperature;
+			return ZE_RESULT_SUCCESS;
+		}
+	}
+	return sensorFound ? ZE_RESULT_ERROR_NOT_AVAILABLE : ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
 }
 
 /**

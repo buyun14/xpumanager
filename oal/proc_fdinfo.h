@@ -16,6 +16,12 @@
  *   auto utils  = fdinfo::delta(before, after);          // pid -> eng -> %
  *   proc.util   = fdinfo::toProcUtil(utils[proc.pid]);
  *
+ * Several devices: one walk per time point serves all of them.
+ *   auto before = fdinfo::captureAll();
+ *   std::this_thread::sleep_for(interval);
+ *   auto after  = fdinfo::captureAll();
+ *   auto utils  = fdinfo::delta(fdinfo::snapshotsFor(before, bdf), fdinfo::snapshotsFor(after, bdf));
+ *
  * On non-Linux platforms all functions are stubs that return empty / zero values.
  */
 
@@ -26,16 +32,19 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Per-process GPU utilisation across the four engine categories.
 // nullopt means no data is available for that engine type.
 struct ProcUtil
 {
-	std::optional<float> compute; ///< Compute Command Streamer  (ccs / compute)
-	std::optional<float> copy;	  ///< Blitter / DMA             (bcs / copy)
-	std::optional<float> render;  ///< Render Command Streamer   (rcs / render)
-	std::optional<float> media;	  ///< Video engines             (vcs / vecs / video)
+	std::optional<float> compute;	   ///< Compute Command Streamer  (ccs / compute)
+	std::optional<float> copy;		   ///< Blitter / DMA             (bcs / copy)
+	std::optional<float> render;	   ///< Render Command Streamer   (rcs / render)
+	std::optional<float> media;		   ///< Video engines             (vcs / vecs / video)
+	std::optional<float> video;		   ///< Decode/encode engines     (vcs / video)
+	std::optional<float> videoEnhance; ///< Video enhancement engines (vecs / video-enhance)
 	// EU metrics — populated via L0 ZET proportional attribution (root / CAP_PERFMON only)
 	std::optional<float> euActive; ///< EU active %  (shaders executing)
 	std::optional<float> euStall;  ///< EU stall %   (shaders blocked — memory / barrier / etc.)
@@ -49,6 +58,7 @@ struct EngineCounters
 	uint64_t cycles = 0;	  ///< busy cycles (xe) or busy ns (i915)
 	uint64_t totalCycles = 0; ///< total GPU cycles (xe); 0 → use wall-clock (i915)
 	uint32_t capacity = 0;	  ///< drm-engine-capacity-<eng>; 0 when not reported, meaning one engine
+	bool hasBusy = false;	  ///< a busy counter was reported, so cycles == 0 means idle, not unknown
 };
 
 // All engine counters for one process on one device at one point in time.
@@ -65,10 +75,36 @@ using EngineUtilMap = std::unordered_map<std::string, float>;
 /// Per-process engine utilisation map: pid → EngineUtilMap
 using PidUtilMap = std::unordered_map<uint32_t, EngineUtilMap>;
 
+/// Snapshots of every DRM client in the system, keyed by the drm-pdev PCI address.
+using DeviceSnapshots = std::unordered_map<std::string, std::vector<ProcessSnapshot>>;
+
 /// Snapshot engine counters for every process whose fdinfo matches @p pciAddr.
 /// @p procRoot defaults to "/proc"; override in tests to point at a fixture directory.
 /// Returns empty vector on non-Linux platforms.
 std::vector<ProcessSnapshot> capture(const std::string &pciAddr, const std::string &procRoot = "/proc");
+
+/**
+ * @brief Snapshots the engine counters of every DRM client of every device in one /proc walk
+ *
+ * One walk serves any number of devices: callers sampling several GPUs take one snapshot
+ * per time point and look each device up with snapshotsFor(), instead of calling capture()
+ * per device, which reads every process's fds again for each GPU.
+ *
+ * @param[in] procRoot Defaults to "/proc"; override in tests to point at a fixture directory.
+ * @retval map   drm-pdev PCI address -> one snapshot per process with a client of that device
+ * @retval empty no DRM client has engine counters, /proc is unreadable, or the platform has no fdinfo
+ */
+[[nodiscard]] DeviceSnapshots captureAll(const std::string &procRoot = "/proc");
+
+/**
+ * @brief The snapshots captureAll() took for one device
+ *
+ * @param[in] all     Result of captureAll().
+ * @param[in] pciAddr PCI address of the device, e.g. "0000:03:00.0".
+ * @retval vector       that device's snapshots, owned by @p all
+ * @retval empty vector the device had no DRM client with engine counters
+ */
+[[nodiscard]] const std::vector<ProcessSnapshot> &snapshotsFor(const DeviceSnapshots &all, std::string_view pciAddr);
 
 /// Compute per-process, per-engine utilisation % from two snapshots.
 /// Returns: pid → (engine_name → 0-100 %)
@@ -124,6 +160,25 @@ struct EngineKey
 ///
 /// Use this to fill psInfo::engines for processes where L0 reports engines == 0.
 [[nodiscard]] uint64_t enginesFromSnapshot(const ProcessSnapshot &snap);
+
+/// Per PID, whether the process ran work on the device between two snapshots of it.
+/// PIDs whose activity cannot be told from the counters are left out.
+/// A rise covering no more than @p minBusyFraction of the window is treated as noise.
+[[nodiscard]] std::unordered_map<uint32_t, bool> ranWorkBetween(const std::vector<ProcessSnapshot> &before,
+																const std::vector<ProcessSnapshot> &after,
+																double minBusyFraction = 0.0);
+
+/// Per PID, total busy ns the process has run on the device, summed over engines.
+/// PIDs whose busy time cannot be converted to ns are left out.
+[[nodiscard]] std::unordered_map<uint32_t, uint64_t> lifetimeBusyNs(const std::vector<ProcessSnapshot> &before,
+																	const std::vector<ProcessSnapshot> &after);
+
+/// How long @p pid has been running, in ns; nullopt when /proc cannot tell.
+[[nodiscard]] std::optional<uint64_t> processAgeNs(uint32_t pid, const std::string &procRoot = "/proc");
+
+/// Number of distinct GPUs out of @p gpuPciAddrs (drm-pdev values) a process holds a DRM client on.
+[[nodiscard]] uint32_t drmDeviceCount(uint32_t pid, const std::unordered_set<std::string> &gpuPciAddrs,
+									  const std::string &procRoot = "/proc");
 
 /// Compute device-level engine utilization from two snapshots by summing per-process
 /// utilization across all active PIDs, capping each engine type at 100%.

@@ -19,6 +19,7 @@ cli_deps = [
   igsc_dep,
   nlohmann_json_dep,
   cli11_dep,
+  watchdog_dep,
 ]
 
 if is_linux
@@ -42,3 +43,7 @@ xpu_smi_exe = executable(
   install: true,
   install_dir: get_option('bindir'),
 )
+
+if get_option('with_tests')
+  subdir('test')
+endif

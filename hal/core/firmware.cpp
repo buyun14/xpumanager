@@ -9,6 +9,7 @@
 #include <gscupd.h>
 #include <pldmextraction.h>
 #include <sysmanupd.h>
+#include <tuple>
 #include <ze_api.h>
 
 /**
@@ -111,14 +112,24 @@ firmware::~firmware()
  * on the specified device, including graphics firmware, data firmware,
  * and other system firmware modules.
  *
+ * A device that exposes no firmware is not an error here. Level Zero Sysman lists no GSC firmware
+ * when it cannot use the IGSC library, possibly none at all, and an update of such a device
+ * explains that, see runUpdateSequence().
+ *
  * @param device Handle to the Level Zero Sysman device
- * @return ze_result_t ZE_RESULT_SUCCESS on successful enumeration, error code otherwise
+ * @return ze_result_t ZE_RESULT_SUCCESS on successful enumeration, also when the device exposes no
+ *         firmware, error code otherwise
  */
 ze_result_t firmware::enumFirmwares(zes_device_handle_t device)
 {
 	ze_result_t result = zesDeviceEnumFirmwares(device, &firmwareCount, nullptr);
-	if (result != ZE_RESULT_SUCCESS || firmwareCount == 0) {
-		ERR("No firmware found or failed to enumerate firmwares. 0x{:X} ({})\n", result, l0_error_to_string(result));
+	if (result != ZE_RESULT_SUCCESS) {
+		ERR("Failed to enumerate firmwares. 0x{:X} ({})\n", result, l0_error_to_string(result));
+		return result;
+	}
+
+	if (firmwareCount == 0) {
+		DBG("Device has no firmwares.\n");
 		return result;
 	}
 
@@ -213,6 +224,10 @@ ze_result_t firmware::getFWversion(fwType type, const char *bdfStr, char *versio
 		return ZE_RESULT_ERROR_INVALID_ARGUMENT;
 	}
 
+	// A failed enumeration is logged where it happens and leaves the version empty, as when
+	// enumeration ran in init().
+	std::ignore = ensureEnumerated();
+
 	// AMC fw version is retrieved differently because we have to ask the AMC card itself
 	if (type == fwType::AMC) {
 		int amc = -1;
@@ -264,12 +279,12 @@ ze_result_t firmware::getAmcSerialNumber(const char *bdfStr, char *serialNum, ui
 	if (a == nullptr) {
 		return ZE_RESULT_ERROR_UNINITIALIZED;
 	}
-	std::string sn, ver;
-	if (a->amcGetCardInfo(std::string(bdfStr), sn, ver) == -1) {
+	const auto sn = a->amcGetSerialNumberByBdf(std::string(bdfStr));
+	if (!sn) {
 		return ZE_RESULT_ERROR_NOT_AVAILABLE;
 	}
 
-	STRCPY_S(serialNum, size, sn.c_str());
+	STRCPY_S(serialNum, size, sn->c_str());
 	return ZE_RESULT_SUCCESS;
 }
 
@@ -310,14 +325,42 @@ ze_result_t firmware::getAmcPartNumber(const char *bdfStr, char *partNum, uint32
 	STRCPY_S(partNum, size, pn.c_str());
 	return ZE_RESULT_SUCCESS;
 }
-/*
+/**
+ * @brief Tells whether Level Zero Sysman listed any firmware that it reaches through the IGSC library
+ *
+ * Sysman lists none of these types when it cannot use IGSC. It reaches FDO without IGSC, and AMC
+ * is not GSC firmware, so neither counts.
+ *
+ * @param [in] cmds The MAX_FW_TYPE firmware update command rows, with the handles found by enumeration
+ * @return bool true if a handle was found for at least one type that Sysman reaches through IGSC
+ */
+static bool igscFirmwareListed(const updateFWCmdStruct *cmds)
+{
+	for (uint32_t i = 0; i < MAX_FW_TYPE; i++) {
+		if (cmds[i].fw != fwType::FDO && cmds[i].fw != fwType::AMC && cmds[i].firmwareHandle != nullptr) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
  * @brief Runs the pre-update, update and post-update handlers of one firmware type
  *
  * The post-update handler is always given a chance to run, so a failed pre-update or update
  * still releases whatever the pre-update acquired.
  *
- * @param cmd The firmware update command row to run
- * @param fwInfo Pointer to firmware information structure containing update details
+ * A failed update handler gets a generic error line, unless it has already printed its own, see
+ * fwupd::failureAlreadyReported().
+ *
+ * A firmware type other than AMC that the device exposes no Level Zero handle for fails before any
+ * handler runs. The error names the type and the device. It also points at the IGSC library when
+ * the enumeration succeeded, the type is not FDO, Sysman listed none of the firmware it reaches
+ * through IGSC, and xpu-smi's own IGSC can query the device's GSC.
+ *
+ * @param [in] cmd The firmware update command row to run
+ * @param [in,out] fwInfo Pointer to firmware information structure containing update details; the
+ *                 handlers may fill in its image buffer
  * @return ze_result_t ZE_RESULT_SUCCESS if update successful, error code otherwise
  */
 ze_result_t firmware::runUpdateSequence(updateFWCmdStruct &cmd, firmwareInfo *fwInfo)
@@ -339,8 +382,18 @@ ze_result_t firmware::runUpdateSequence(updateFWCmdStruct &cmd, firmwareInfo *fw
 	fwupd *fw = fwupdArray[cmd.preference];
 
 	if ((fwInfo->fwType != fwType::AMC) && fwInfo->firmwareHandle == nullptr) {
-		ERR("Failed to find firmware handle 0x{:X} ({})\n", ZE_RESULT_ERROR_UNKNOWN,
-			l0_error_to_string(ZE_RESULT_ERROR_UNKNOWN));
+		// Sysman loads its own IGSC library to reach the GSC firmware. When it lists none of that firmware
+		// although xpu-smi's IGSC can query this GPU's GSC, the library Sysman needs is missing or too old.
+		// A device without a reachable GSC, such as an integrated GPU, lists none either and gets no hint,
+		// and a failed enumeration has already been reported. getFWStatus() is "unknown" when IGSC cannot
+		// query the GSC; it goes last, as it talks to the device.
+		const bool igscUnusable = enumResult == ZE_RESULT_SUCCESS && fwInfo->fwType != fwType::FDO &&
+								  fwInfo->dev != nullptr && !igscFirmwareListed(updateFWCmds) &&
+								  fwInfo->dev->getPCI()->getFWStatus() != "unknown";
+		ERR("Level Zero Sysman exposes no {} firmware on device {}.{}\n", cmd.fwName.c_str(), fwInfo->deviceIndex,
+			igscUnusable ? " The GPU runtime needs the shared igsc library to reach the firmware; check that it is "
+						   "installed."
+						 : "");
 		return ZE_RESULT_ERROR_UNKNOWN;
 	}
 
@@ -353,8 +406,7 @@ ze_result_t firmware::runUpdateSequence(updateFWCmdStruct &cmd, firmwareInfo *fw
 	}
 	result = (fw->*cmd.updateFunc)(fwInfo);
 	if (result != ZE_RESULT_SUCCESS) {
-		if (result != ZE_RESULT_ERROR_UNINITIALIZED && result != ZE_RESULT_ERROR_INVALID_ARGUMENT &&
-			result != ZE_RESULT_ERROR_INVALID_SIZE) {
+		if (!fwupd::failureAlreadyReported(result)) {
 			ERR("Failed to update firmware 0x{:X} ({})\n", result, l0_error_to_string(result));
 		}
 		(fw->*cmd.postUpdateFunc)(fwInfo);
@@ -412,6 +464,10 @@ ze_result_t firmware::getAmcTdp(const char *bdfStr, char *tdp, size_t *bufferSiz
 ze_result_t firmware::updateFW(firmwareInfo *fwInfo)
 {
 	TRACING();
+
+	// Firmware handles come from enumeration. A failure is logged where it happens and leaves the
+	// handle null, as when enumeration ran in init(); the update then fails in its own sequence.
+	std::ignore = ensureEnumerated();
 
 	// A composite package is not a single image: it is unwrapped and its components are flashed
 	// through the firmware types below.
@@ -690,22 +746,47 @@ bool firmware::hasAmcFirmware()
  */
 ze_result_t firmware::init(zes_device_handle_t device)
 {
-	ze_result_t result = enumFirmwares(device);
+	zesDevice = device;
+	enumerated = false;
 
-	// Create a fwupd array that holds all different types of firmware updates
+	// Create a fwupd array that holds all different types of firmware updates. The AMC entry is
+	// used during device init (getAmcIndex), so this part stays eager.
 	fwupdArray = new fwupd *[FWUPD_PREFERENCE_MAX];
 	fwupdArray[FWUPD_PREFERENCE_GSC] = new gscupd();
 	fwupdArray[FWUPD_PREFERENCE_SYSMAN] = new sysmanupd();
 	fwupdArray[FWUPD_PREFERENCE_AMC] = new amcupd();
 
-	for (uint32_t i = 0; i < firmwareCount; i++) {
-		result = getProperties(firmwareList[i]);
-		if (result != ZE_RESULT_SUCCESS) {
-			return result;
-		}
+	return ZE_RESULT_SUCCESS;
+}
+
+/**
+ * @brief Enumerates the device's firmware and reads its properties the first time it is needed
+ *
+ * zesDeviceEnumFirmwares and zesFirmwareGetProperties talk to the GSC over MEI, which costs
+ * ~1 s per device as root on some platforms. Only firmware version queries and updates need
+ * the result, so every method that reads updateFWCmds calls this instead of init() doing it.
+ * The outcome of the first attempt is kept, so a device is not re-queried.
+ *
+ * @retval ZE_RESULT_SUCCESS  Firmware handles and versions are populated (possibly none).
+ * @retval other              The error from the first enumeration or property query.
+ */
+ze_result_t firmware::ensureEnumerated()
+{
+	if (enumerated) {
+		return enumResult;
+	}
+	enumerated = true;
+
+	if (zesDevice == nullptr) {
+		enumResult = ZE_RESULT_ERROR_UNINITIALIZED;
+		return enumResult;
 	}
 
-	return result;
+	enumResult = enumFirmwares(zesDevice);
+	for (uint32_t i = 0; enumResult == ZE_RESULT_SUCCESS && i < firmwareCount; i++) {
+		enumResult = getProperties(firmwareList[i]);
+	}
+	return enumResult;
 }
 
 /**
