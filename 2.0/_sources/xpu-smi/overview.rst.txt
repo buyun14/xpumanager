@@ -62,9 +62,11 @@ These options are available at the top level (without a subcommand), except
 
 .. option:: --timeout=<sec>, --timeout <sec>
 
-   Abort if ``xpu-smi`` makes no progress for ``<sec>`` seconds (default: ``30``), for
-   example because a driver call does not return. ``0`` turns the timeout off; the maximum
-   is ``86400``. Time spent waiting between samples (``--loop``, ``dump -i``, ``stats``)
+   Abort if ``xpu-smi`` makes no progress for ``<sec>`` seconds, for example because a driver
+   call does not return. Without the option the timeout is ``60`` seconds, plus ``5`` for each
+   GPU on Linux: driver initialization and the firmware fields of ``--query-gpu`` and ``dump``
+   handle one GPU after another, so they take longer on a host with more GPUs. ``0`` turns the
+   timeout off; the maximum is ``86400``. Time spent waiting between samples (``--loop``, ``dump -i``, ``stats``)
    does not count, so long-running loops are not affected.
 
    After half the timeout without progress, a warning on stderr names the phase that is
@@ -72,9 +74,11 @@ These options are available at the top level (without a subcommand), except
    restores the terminal, prints the phase and one line per thread to stderr, and exits
    with code ``124``.
 
-   The timeout is suspended while firmware is being written (``updatefw``): a flash can take
-   several minutes, and interrupting one can leave the card unusable. It starts again,
-   with the full timeout, once flashing ends.
+   The timeout is suspended while firmware is being written (``updatefw``) and while a GPU
+   is being reset (``config --reset``, ``config --coldreset``, ``amc --gpureset``): a flash
+   can take several minutes and a reset about one, and interrupting either can leave the
+   card unusable or off the PCI bus. It starts again, with the full timeout, once the
+   operation ends.
 
 Synopsis
 --------
@@ -296,9 +300,10 @@ Multi-char combos expand character-by-character (e.g. ``pu`` = POWER + TEMPERATU
      - Level Zero user-mode driver version string
    * - ``kernel_driver_version``
      - —
-     - Kernel-mode driver release version (``modinfo`` ``version``), declared only
-       by the out-of-tree driver installed via DKMS. The key is omitted when the
-       driver declares no version
+     - Kernel-mode driver release version (``modinfo`` ``version``) for the
+       out-of-tree driver installed via DKMS, or the kernel version marked as
+       in-tree (e.g. ``6.8.0-45 (in-tree)``) for the in-tree driver. The key is
+       omitted when neither is available, as on Windows
    * - ``vbios_version``
      - —
      - GFX firmware version (shown as GFX Firmware Version in the query report)
