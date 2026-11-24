@@ -26,6 +26,7 @@
   - [6. 核心问题：loader 与驱动版本必须匹配](#6-核心问题loader-与驱动版本必须匹配)
 - [根本矛盾：README 与 conanfile.py 的版本要求不一致](#根本矛盾readme-与-conanfilepy-的版本要求不一致)
 - [SYSMAN 兼容垫片](#sysman-兼容垫片)
+- [xpumd Go 绑定的 Level Zero 头文件版本](#xpumd-go-绑定的-level-zero-头文件版本)
 - [已知限制](#已知限制)
 - [环境清理](#环境清理)
 
@@ -353,6 +354,126 @@ meson setup builddir --native-file .conan/conan_meson_native.ini \
 
 2. **枚举常量**：正确常量是 `ZES_DEVICE_ACTION_NONE`（枚举），
    不存在 `ZES_STRUCTURE_TYPE_DEVICE_ACTION`。
+
+---
+
+## xpumd Go 绑定的 Level Zero 头文件版本
+
+> 上游 `947b47ea`（bump C headers to API v1.19.12）之后新增。
+
+### 现象
+
+编译 `xpumd` 的 Go 绑定时报错：
+
+```
+# github.com/intel/level-zero-go/core
+../../level-zero-go/core/core_static.go:29:5: invalid array length
+  _level_zero_header_minor_API_version_too_old (constant -6 of type int)
+```
+
+### 根因
+
+`level-zero-go/core/core_static.go` 用**编译期数组长度**做版本断言：
+
+```go
+_level_zero_header_minor_API_version_too_old =
+    int(C.ZE_API_VERSION_CURRENT&0xffff) - int(API_VERSION_CURRENT&0xffff)
+```
+
+绑定生成于 Level Zero API **1.19**（`API_VERSION_CURRENT = 65555`），
+而系统头文件只有 API **1.13**（loader 1.24.1 自带），差值 `-6` → 负数数组长度。
+
+注意：**这与 SYSMAN 垫片是两回事**。垫片补的是**运行时**符号缺失，
+这里是**编译期**头文件版本不匹配。
+
+### 解决
+
+仓库里已经 vendored 了 1.19 的头文件
+（`xpumd/level-zero-go/level-zero/`，逐字拷贝自 oneapi-src/level-zero v1.34.0），
+只需让 pkg-config 指向它们，而**运行时仍链系统 loader**：
+
+```bash
+# /public/vllm/.pkgconfig/level-zero.pc
+prefix=/public/vllm/xpumanager/xpumd/level-zero-go/level-zero
+includedir=${prefix}
+libdir=/usr/lib/x86_64-linux-gnu
+
+Name: Level Zero
+Description: Level Zero (vendored API 1.19 headers, system loader)
+Version: 1.19
+Libs: -L${libdir} -lze_loader
+Cflags: -I${includedir}
+```
+
+```bash
+export PKG_CONFIG_PATH=/public/vllm/.pkgconfig:$PKG_CONFIG_PATH
+```
+
+思路与上游 stub driver 的 `level-zero-stub/level-zero.pc` 一致：
+头文件用新版、链接库用系统版。
+
+### 链接期符号缺失（Go 侧）
+
+即使头文件版本对上了，链接 `xpumd` 时仍会失败：
+
+```
+/usr/bin/ld: ... undefined reference to `zesPowerGetUsage'
+/usr/bin/ld: ... undefined reference to `zesDriverGetProperties'
+...
+```
+
+Go 绑定通过 cgo **直接调用**这些 SYSMAN 扩展函数，
+而系统 loader 1.24.1 完全没有导出它们。共缺 **15 个**：
+
+| 类别 | 符号 |
+|---|---|
+| 健康状态 | `zesDeviceGetHealthStatusExt`、`zesDeviceSetHealthStatusExt`、`zesDevicePciLinkSpeedUpdateExt` |
+| Driver 属性/事件 | `zesDriverGetProperties`、`zesDriverEventRegisterExt`、`zesDriverEventListenExt` |
+| Info logs | `zesInfoLogCreateInstanceExt`、`zesInfoLogGetPropertiesExt`、`zesInfoLogInstanceDeleteExt`、`zesInfoLogInstancePeekWithMetadataExt`、`zesInfoLogInstanceReadWithMetadataExt`、`zesDriverEnumInfoLogsExt` |
+| 功耗 | `zesPowerGetUsage`、`zesPowerGetLimitsExt2`、`zesPowerSetLimitsExt2` |
+
+这与 C++ 侧的 SYSMAN 垫片是**同一个根因**（loader 太老），只是 Go 侧
+无法像 C++ 那样在目标文件里塞桩 —— cgo 绑定是直接外部引用。
+
+**解决：用上游自带的 stub driver 构建**（上游 CI 的常规路径）。
+`level-zero-go/level-zero-stub/` 实现了全部 146 个 SYSMAN 符号：
+
+```bash
+# 需要额外的系统依赖
+apt-get install -y libcyaml-dev libyaml-dev
+
+cd xpumd
+export GOPROXY=https://goproxy.cn,direct
+export GOSUMDB=sum.golang.google.cn
+make build-stub        # 产出 dist-stub/xpumd 和 dist-stub/xpuinfo-cli
+```
+
+运行需要指定 stub 的配置：
+
+```bash
+SYSMAN_STUB_CONFIG=level-zero-go/level-zero-stub/example-config.yaml \
+  ./dist-stub/xpumd --config config-example.yaml
+```
+
+> **注意**：`make build`（非 stub）在本机**必然失败**，
+> 因为它链接的是系统 loader 1.24.1。
+> 生产部署需要 loader 1.34.0 + 配套驱动（见[第 6 节](#6-核心问题loader-与驱动版本必须匹配)）。
+
+### 顺带：Go 模块代理
+
+`proxy.golang.org` 在本机不可达（IPv6 解析到 `2607:f8b0:400a:800::2011` 后超时），
+需改用国内镜像：
+
+```bash
+export GOPROXY=https://goproxy.cn,direct
+export GOSUMDB=sum.golang.google.cn
+```
+
+### 已知非问题
+
+`level-zero-go/internal/testhelper` 需要 `-tags test`（跑 stub 测试）
+或 `-tags lint`（跑 golangci-lint）。裸 `go build ./...` 报
+`undefined: stubReload` 属**上游设计**，不是回归。
 
 ---
 
