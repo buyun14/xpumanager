@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -37,6 +38,7 @@ type xpuInfoExporter struct {
 	settings   exporter.Settings
 	grpcServer *grpc.Server
 	infoServer *deviceInfoServer
+	lis        net.Listener
 
 	started bool
 }
@@ -66,6 +68,7 @@ func (e *xpuInfoExporter) start(ctx context.Context, host component.Host) error 
 	e.telemetry = tb
 
 	if err := e.startGrpcServer(ctx); err != nil {
+		tb.Shutdown()
 		return fmt.Errorf("failed to start gRPC server: %w", err)
 	}
 
@@ -86,35 +89,31 @@ func (e *xpuInfoExporter) shutdown(ctx context.Context) error {
 
 	e.logger.Info("Shutting down XPU Info exporter")
 
+	e.infoServer.stop()
+
+	// Force stop if the graceful one takes too long.
 	ctx, cancel := context.WithTimeout(ctx, shutdownTimeout)
 	defer cancel()
+	stopForced := context.AfterFunc(ctx, e.grpcServer.Stop)
 
-	done := make(chan struct{})
-	go func() {
-		if e.infoServer != nil {
-			e.infoServer.stop()
-		}
-		if e.grpcServer != nil {
-			e.grpcServer.GracefulStop()
-		}
-		close(done)
-	}()
+	e.grpcServer.GracefulStop()
+	wasForceStopped := !stopForced()
+	// GracefulStop only closes listeners that Serve has already picked up.
+	_ = e.lis.Close()
+	e.telemetry.Shutdown()
 
-	select {
-	case <-done:
-		e.logger.Info("gRPC server stopped gracefully")
-	case <-ctx.Done():
-		// Force stop
-		if e.grpcServer != nil {
-			e.grpcServer.Stop()
-		}
-		return fmt.Errorf("gRPC server shutdown timed out: %v", ctx.Err())
+	if wasForceStopped {
+		return fmt.Errorf("gRPC server shutdown timed out: %w", ctx.Err())
 	}
+	e.logger.Info("gRPC server stopped gracefully")
 	return nil
 }
 
-func (e *xpuInfoExporter) pushMetrics(_ context.Context, md pmetric.Metrics) error {
+func (e *xpuInfoExporter) pushMetrics(ctx context.Context, md pmetric.Metrics) error {
 	e.logger.Debugw("Pushing metrics", "dataPoints", md.DataPointCount())
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// NOTE: No batching is in place. We rely on the property that md contains
 	// all metrics for a particular device.
@@ -123,8 +122,11 @@ func (e *xpuInfoExporter) pushMetrics(_ context.Context, md pmetric.Metrics) err
 	return nil
 }
 
-func (e *xpuInfoExporter) pushLogs(_ context.Context, ld plog.Logs) error {
+func (e *xpuInfoExporter) pushLogs(ctx context.Context, ld plog.Logs) error {
 	e.logger.Debugw("Pushing logs", "logRecords", ld.LogRecordCount())
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	e.infoServer.broadcastEvents(ld)
 	return nil
 }
@@ -188,9 +190,11 @@ func (e *xpuInfoExporter) startGrpcServer(ctx context.Context) error {
 	e.logger.Infow("gRPC server listening", "endpoint", e.cfg.NetAddr.Endpoint)
 	e.grpcServer = grpcServer
 	e.infoServer = infoServer
+	e.lis = lis
 
 	go func() {
-		if err := grpcServer.Serve(lis); err != nil {
+		// Serve returns ErrServerStopped if shutdown happened before it got to run.
+		if err := grpcServer.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			e.logger.Errorw("gRPC server failed", "error", err)
 		}
 	}()

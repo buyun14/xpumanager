@@ -12,6 +12,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifndef ARRAY_SIZE
@@ -56,11 +57,19 @@ uint32_t getCurrentProcessId();
 std::string timestamp();
 int amcCardDiscovery(void *amcDeviceList);
 int getXeDevPciProps(std::vector<xeDevPciInfo> *pciPropsList);
+// GPU BDFs in xpu-smi device-index order, found without Level Zero. Returns the count, or -1
+// where the OS layer cannot predict the order.
+int getLevelZeroGpuOrder(std::vector<std::string> *bdfList);
 void setProgress(int devIndex, int lineNum, int totalThreads, uint32_t progress, const char *label = nullptr);
 void progressBegin(int lines);
 void progressEnd();
 void progressPrintAbove(const std::function<void()> &write, bool endsLine = true);
 inline std::mutex progressPrintMutex;
+
+// Marks a KMD version that is the kernel's own, reported for the in-tree driver, which
+// names no release (e.g. "6.8.0-45 (in-tree)"). Shared so the xpu-smi banner, which
+// prefers an out-of-tree release over it, recognises the value the OAL produces.
+inline constexpr std::string_view KMD_IN_TREE_SUFFIX = " (in-tree)";
 
 #ifdef _WIN32
 #include "win/oswin.h"

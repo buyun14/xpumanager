@@ -83,7 +83,7 @@ discovery_test = executable(
     global_inc,
     ial_cmn_inc,
   ],
-  dependencies: [doctest_dep],
+  dependencies: [doctest_dep, nlohmann_json_dep],
   link_args: is_linux ? ['-pie'] : [],
   build_by_default: true,
   install: false,
@@ -272,5 +272,22 @@ if is_linux
   )
 
   test('config_test', config_test)
+
+  health_test = executable(
+    'health_test',
+    ['health_test.cpp', fake_temperature_sysman_src],
+    include_directories: [
+      global_inc,
+      ial_cmn_inc,
+    ],
+    link_with: ial_cmn_lib,
+    dependencies: ial_cmn_test_deps,
+    cpp_args: ial_cmn_cpp_args,
+    link_args: ['-pie'],
+    build_by_default: true,
+    install: false,
+  )
+
+  test('health_test', health_test)
 
 endif

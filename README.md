@@ -36,7 +36,7 @@ Intel(R) XPU System Management Interface (XPU-SMI) is a command line interface (
 	* GPU crash log management (Linux only) - enable, disable, trigger, clear, and extract Intel Crash Log records via the `iclg` utility
 * Monitoring:
 	* GPU telemetry – utilization, power, frequency, temperature, fabric speed, memory throughput, errors
-	* GPU health – memory, power, temperature, fabric port
+	* GPU health – temperature, power, frequency
 	* [GPU metric exporter daemon](xpumd/README.md)
 * Configuration:
 	* GPU Settings - GPU power limits, frequency range, standby mode, scheduler mode, ECC On/Off, fabric port status
@@ -67,6 +67,13 @@ $ xpu-smi
 |     0     2874292     C      xpu-smi                                                       206 MiB |
 +-------+-----------+--------+----------------+------------------------------------------------------+
 ```
+With the in-tree kernel driver, which declares no release version, KMD Version
+shows the kernel version instead, marked as in-tree:
+
+```
+|                       Intel XPU-SMI v2.0    KMD Version: 6.8.0-45 (in-tree)                        |
+```
+
 ### Running xpu-smi discovery
 
 ```

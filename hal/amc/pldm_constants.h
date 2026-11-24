@@ -37,8 +37,12 @@
 #define PLDM_GETCOMMANDS_SIZE 17
 #define PLDM_GETFRUTABLEMETADATA_SIZE 12
 #define PLDM_GETFRUTABLE_SIZE 17
-#define PLDM_MAX_RESPONSE_SIZE 128
 #define PLDM_CMD_RESP_PAYLOAD_SIZE 1
+// The *_SIZE constants above, and the size passed to the PLDM command functions, give a request as the
+// single SMBus frame it used to be sent as: the SMBus/MCTP header through the message type byte
+// (mctpSmbusI2cHdr) and the PLDM header, then the request data. This is the part ahead of the data, so the
+// request data is size - PLDM_REQUEST_FRAME_HDR_SIZE bytes; the byte after it is the old payload PEC, unused.
+#define PLDM_REQUEST_FRAME_HDR_SIZE 12
 
 // DSP0240 Table 6 timing for PLDM requests
 // PT2, wait for the start of a response: PT1max + 2*PT4max (300 ms) to PT3min - 2*PT4max (4.8 s).
@@ -46,6 +50,10 @@
 #define PLDM_PT2_MS 2500
 // PN1, retries a requester is obligated to make: at least 2 (three tries in total)
 #define PLDM_PN1_RETRIES 2
+// Times a request is sent again when its response began to arrive but was lost (a damaged or cut-off
+// packet), on top of the DSP0240 PN1 retries and within PT3. Each costs one exchange, not a PT2 wait;
+// a local value, not a protocol one.
+#define PLDM_LOST_RESPONSE_RETRIES 8
 // PT3 max, instance ID expiration: all retries of a request happen within this time of the first try
 #define PLDM_PT3_MAX_MS 6000
 

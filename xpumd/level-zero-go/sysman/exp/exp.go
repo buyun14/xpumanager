@@ -22,7 +22,7 @@ import (
 	"github.com/intel/level-zero-go/core"
 )
 
-// zesRasGetStateExp function as declared in level-zero/zes_api.h:7914
+// zesRasGetStateExp function as declared in level-zero/zes_api.h:8111
 func zesRasGetStateExp(HRas rasHandle, PCount *uint32, PState []RasStateExp) core.Result {
 	cHRas, _ := *(*C.zes_ras_handle_t)(unsafe.Pointer(&HRas)), cgoAllocsUnknown
 	cPCount, _ := (*C.uint32_t)(unsafe.Pointer(PCount)), cgoAllocsUnknown
@@ -32,11 +32,50 @@ func zesRasGetStateExp(HRas rasHandle, PCount *uint32, PState []RasStateExp) cor
 	return __v
 }
 
-// zesRasClearStateExp function as declared in level-zero/zes_api.h:7960
+// zesRasClearStateExp function as declared in level-zero/zes_api.h:8157
 func zesRasClearStateExp(HRas rasHandle, Category RasErrorCategoryExp) core.Result {
 	cHRas, _ := *(*C.zes_ras_handle_t)(unsafe.Pointer(&HRas)), cgoAllocsUnknown
 	cCategory, _ := (C.zes_ras_error_category_exp_t)(Category), cgoAllocsUnknown
 	__ret := C.zesRasClearStateExp(cHRas, cCategory)
+	__v := (core.Result)(__ret)
+	return __v
+}
+
+// zesDeviceEnumEnabledVFExp function as declared in level-zero/zes_api.h:9059
+func zesDeviceEnumEnabledVFExp(HDevice deviceHandle, PCount *uint32, PhVFhandle []vfHandle) core.Result {
+	cHDevice, _ := *(*C.zes_device_handle_t)(unsafe.Pointer(&HDevice)), cgoAllocsUnknown
+	cPCount, _ := (*C.uint32_t)(unsafe.Pointer(PCount)), cgoAllocsUnknown
+	cPhVFhandle, _ := (*C.zes_vf_handle_t)(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&PhVFhandle)).Data)), cgoAllocsUnknown
+	__ret := C.zesDeviceEnumEnabledVFExp(cHDevice, cPCount, cPhVFhandle)
+	__v := (core.Result)(__ret)
+	return __v
+}
+
+// zesVFManagementGetVFMemoryUtilizationExp2 function as declared in level-zero/zes_api.h:9135
+func zesVFManagementGetVFMemoryUtilizationExp2(HVFhandle vfHandle, PCount *uint32, PMemUtil []VfUtilMemExp2) core.Result {
+	cHVFhandle, _ := *(*C.zes_vf_handle_t)(unsafe.Pointer(&HVFhandle)), cgoAllocsUnknown
+	cPCount, _ := (*C.uint32_t)(unsafe.Pointer(PCount)), cgoAllocsUnknown
+	cPMemUtil, _ := (*C.zes_vf_util_mem_exp2_t)(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&PMemUtil)).Data)), cgoAllocsUnknown
+	__ret := C.zesVFManagementGetVFMemoryUtilizationExp2(cHVFhandle, cPCount, cPMemUtil)
+	__v := (core.Result)(__ret)
+	return __v
+}
+
+// zesVFManagementGetVFEngineUtilizationExp2 function as declared in level-zero/zes_api.h:9178
+func zesVFManagementGetVFEngineUtilizationExp2(HVFhandle vfHandle, PCount *uint32, PEngineUtil []VfUtilEngineExp2) core.Result {
+	cHVFhandle, _ := *(*C.zes_vf_handle_t)(unsafe.Pointer(&HVFhandle)), cgoAllocsUnknown
+	cPCount, _ := (*C.uint32_t)(unsafe.Pointer(PCount)), cgoAllocsUnknown
+	cPEngineUtil, _ := (*C.zes_vf_util_engine_exp2_t)(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&PEngineUtil)).Data)), cgoAllocsUnknown
+	__ret := C.zesVFManagementGetVFEngineUtilizationExp2(cHVFhandle, cPCount, cPEngineUtil)
+	__v := (core.Result)(__ret)
+	return __v
+}
+
+// zesVFManagementGetVFCapabilitiesExp2 function as declared in level-zero/zes_api.h:9219
+func zesVFManagementGetVFCapabilitiesExp2(HVFhandle vfHandle, PCapability *VfExp2Capabilities) core.Result {
+	cHVFhandle, _ := *(*C.zes_vf_handle_t)(unsafe.Pointer(&HVFhandle)), cgoAllocsUnknown
+	cPCapability, _ := (*C.zes_vf_exp2_capabilities_t)(unsafe.Pointer(PCapability)), cgoAllocsUnknown
+	__ret := C.zesVFManagementGetVFCapabilitiesExp2(cHVFhandle, cPCapability)
 	__v := (core.Result)(__ret)
 	return __v
 }

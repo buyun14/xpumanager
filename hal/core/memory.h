@@ -17,7 +17,7 @@
 #include <zes_api.h>
 
 /**
- * @brief Memory vendor information collected from the memory vendor ID extension.
+ * @brief Memory vendor information collected from the memory vendor info extension.
  */
 struct MemoryVendorData
 {
@@ -44,8 +44,8 @@ inline constexpr auto MEMORY_INTEL_TYPE_LPDDR5X = static_cast<zes_mem_type_t>(50
  *
  * Holds the memory specification a device reports about its own video memory.
  * Capacity, bus width and channel count already have their own accessors
- * (getMemorySize(), getMemoryBusWidth(), getMemoryChannels()), so what this adds
- * is the memory form/type plus the identification fields the ticket asks for.
+ * (getMemorySize(), getMemoryBusWidth(), getMemoryChannels()) and the vendor is
+ * read by getMemoryVendor(), so what this adds is the memory form/type.
  *
  * The form/type is resolved from two independent Level Zero sources because
  * neither is complete on its own:
@@ -57,21 +57,10 @@ inline constexpr auto MEMORY_INTEL_TYPE_LPDDR5X = static_cast<zes_mem_type_t>(50
  *     memory generations that the sysman enum cannot express at all: zes_mem_type_t
  *     has a single ZES_MEM_TYPE_HBM value, while the core enum separates
  *     HBM2/HBM2E/HBM3/HBM3E/HBM4.
- *
- * @note vendor, dateCode and dieInfo have no source in the current software
- *       stack: no Level Zero interface (core, sysman, or the Intel sysman
- *       extensions), no kernel-mode driver interface (sysfs or debugfs), and no
- *       igsc entry point exposes memory manufacturer, date code or IC/die data.
- *       They are carried here so that the collection path and the CLI fields
- *       already exist once a driver or firmware interface does expose them, and
- *       until then they report MEMORY_SPEC_UNKNOWN -- they are never guessed.
  */
 struct MemorySpecData
 {
 	std::string typeName{MEMORY_SPEC_UNKNOWN}; // resolved form/type, e.g. "LPDDR5X", "HBM3"
-	std::string vendor{MEMORY_SPEC_UNKNOWN};   // no platform source yet, see note above
-	std::string dateCode{MEMORY_SPEC_UNKNOWN}; // no platform source yet, see note above
-	std::string dieInfo{MEMORY_SPEC_UNKNOWN};  // no platform source yet, see note above
 };
 
 /**
@@ -106,13 +95,11 @@ private:
 	zes_driver_handle_t zesDriver = nullptr;
 	uint32_t pciDeviceId = 0;
 
-	// Cached result of the memory vendor ID extension support check (see isMemoryVendorSupported).
+	// Cached result of the memory vendor info extension support check (see isMemoryVendorSupported).
 	// -1 = not yet queried, 0 = unsupported, 1 = supported.
 	int memoryVendorSupported = -1;
-	// pNext stype of the vendor extension the driver advertises; set when memoryVendorSupported == 1.
-	uint32_t memoryVendorStype = 0;
 
-	// Returns true when the driver advertises the memory vendor ID extension. The result is cached
+	// Returns true when the driver advertises the memory vendor info extension. The result is cached
 	// so the driver extension list is only enumerated once per device.
 	bool isMemoryVendorSupported();
 
@@ -130,7 +117,6 @@ public:
 	ze_result_t getBandwidth(zes_mem_handle_t memhandle, zes_mem_bandwidth_t *bandwidth);
 	ze_result_t getMemorySize(uint64_t *size);
 	[[nodiscard]] ze_result_t getMemoryReserved(uint64_t *reserved);
-	ze_result_t getMemoryHealth(zes_mem_health_t *health);
 	ze_result_t getMemoryChannels(int32_t *channels);
 	ze_result_t getMemoryBusWidth(int32_t *busWidth);
 	ze_result_t getMemoryVendor(MemoryVendorData *vendor);

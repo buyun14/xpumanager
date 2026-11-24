@@ -344,61 +344,6 @@ ze_result_t memory::getMemoryReserved(uint64_t *reserved)
 }
 
 /**
- * @brief Determines overall memory health status across all modules
- *
- * This function evaluates the health status of all memory modules and returns
- * the most severe health condition found. It prioritizes critical/replace status
- * over degraded, and degraded over OK, providing comprehensive memory health assessment.
- *
- * @param health Pointer to variable that will receive overall memory health status
- * @return ze_result_t ZE_RESULT_SUCCESS on successful health assessment, error code otherwise
- */
-ze_result_t memory::getMemoryHealth(zes_mem_health_t *health)
-{
-	ze_result_t result = ZE_RESULT_SUCCESS;
-	zes_mem_state_t state = {};
-
-	if (health == nullptr) {
-		ERR("Health pointer is null.\n");
-		return ZE_RESULT_ERROR_INVALID_NULL_POINTER;
-	}
-	*health = ZES_MEM_HEALTH_UNKNOWN;
-
-	for (std::size_t i = 0; i < memoryModules.size(); i++) {
-		result = getState(memoryModules[i], &state);
-		if (result != ZE_RESULT_SUCCESS) {
-			ERR("Failed to get Memory state for module {}. 0x{:X} ({})\n", i, result, l0_error_to_string(result));
-			return result;
-		}
-		if (state.health == ZES_MEM_HEALTH_CRITICAL || state.health == ZES_MEM_HEALTH_REPLACE) {
-			*health = state.health;
-			DBG("Memory health is critical or replace for module {}.\n", i);
-			return result;
-		} else if (state.health == ZES_MEM_HEALTH_DEGRADED) {
-			*health = ZES_MEM_HEALTH_DEGRADED;
-			DBG("Memory health is degraded for module {}.\n", i);
-			return result;
-		} else if (state.health == ZES_MEM_HEALTH_OK) {
-			// Only in this case we continue the for loop because the health of this module is OK
-			// and we want to check the health of other modules.
-			// If all modules are OK, we will return ZES_MEM_HEALTH_OK at the end.
-			// If any module is degraded, critical, or replace, we will return that health status.
-			// This is to ensure that we do not prematurely return ZES_MEM_HEALTH_OK
-			// if there are other modules that might have a different health status.
-			// This is a design choice to ensure we report the most severe health status
-			// across all memory modules.
-			*health = ZES_MEM_HEALTH_OK;
-			DBG("Memory health is OK for module {}.\n", i);
-		} else {
-			*health = ZES_MEM_HEALTH_UNKNOWN;
-			DBG("Memory health is unknown for module {}.\n", i);
-			return result;
-		}
-	}
-	return result;
-}
-
-/**
  * @brief Corrects the CRI soft-SKU memory channel count when capacity proves fewer channels are populated
  *
  * Older compute-runtime versions report CRI's 20-MSU full-SKU maximum through
@@ -1103,8 +1048,7 @@ ze_device_memory_ext_type_t memory::collectCoreMemoryType(ze_device_handle_t cor
  *
  * Resolves the memory form/type from the sysman per-module properties (already
  * enumerated by init()) and from the core device memory properties with their
- * pNext extension, so the type is reported whenever either source knows it. The
- * identification fields no interface exposes are left as MEMORY_SPEC_UNKNOWN.
+ * pNext extension, so the type is reported whenever either source knows it.
  *
  * The core query is issued here rather than reusing the cached
  * device::getMemProps() array because an extension struct chained on pNext
@@ -1114,8 +1058,8 @@ ze_device_memory_ext_type_t memory::collectCoreMemoryType(ze_device_handle_t cor
  * @param[in] coreDevice Core (non-sysman) Level Zero device handle; may be null
  *                       on a device in survivability mode, in which case only
  *                       the sysman type is collected
- * @param[out] spec Memory specification to populate; left at its defaults
- *                  (everything MEMORY_SPEC_UNKNOWN) when no source answers
+ * @param[out] spec Memory specification to populate; left at its default
+ *                  (MEMORY_SPEC_UNKNOWN) when no source answers
  * @return ze_result_t ZE_RESULT_SUCCESS when at least one source answered, the
  *         last error encountered when every source failed, or
  *         ZE_RESULT_ERROR_UNSUPPORTED_FEATURE when there was nothing to query

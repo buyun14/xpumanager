@@ -2,6 +2,8 @@
 
 Contents:
 
+* [XPUM 2.x.x](#xpum-2xx)
+* [XPUM 2.4.0](#xpum-240)
 * [XPUM 2.3.0](#xpum-230)
 * [XPUM 2.2.0](#xpum-220)
 * [XPUM 2.1.0](#xpum-210)
@@ -15,6 +17,15 @@ Contents:
 
 ## XPUM 2.x.x
 
+* XPUMD privileges: NET_ADMIN capability is required by an upcoming GPU driver
+  release for the RAS error events, and is added to the Helm chart
+* Sysman Go bindings: Update to L0 API spec v1.19.12 (in loader 1.34.0), adding
+  new extensions for driver properties, driver-scoped events and info logs
+* XPUMD image: L0 driver stack update to 26.40.40196.8 + loader 1.34.0
+
+
+## XPUM 2.4.0
+
 * Breaking changes (for the XPUMD config):
   * `intel_crashlog` receiver `glob` option replaced by `globs` list, to support multiple filename patterns
     * **Action required:** if custom config is used, the `glob: "<pattern>"` needs to be updated to `globs: ["<pattern>"]`
@@ -25,7 +36,7 @@ Contents:
   * Proto package renamed from `deviceinfo` to `deviceinfo.v1alpha2`
   * `SeverityLevel` enum values of `SEVERITY_LEVEL_OK` and `SEVERITY_LEVEL_UNKNOWN` swapped (`OK=0`, `UNKNOWN=1`), so that the numeric value increases with severity
   * **Action required:** gRPC clients need to be regenerated from the updated `deviceinfo.proto`
-* Metric workarounds:
+* Workarounds (for L0 Sysman metrics functionality):
   * Report also disabled power limits (part of [#184](https://github.com/intel/xpumanager/issues/184) fix)
   * SR-IOV virtual functions are skipped, as they provide duplicate or bogus metrics of their PF
   * OEM serial ID is used as `hw.gpu.info` serial number fallback (like `xpu-smi` does)
@@ -34,6 +45,8 @@ Contents:
   * Log output includes all relevant metric (differentiation) attributes
   * New internal telemetry metrics: `otelcol_sysman_sampler_missed_deadlines`,
     `otelcol_sysman_sampler_interval_usage` and `otelcol_crashlogs_dropped`
+  * Disabling metrics skips also the GPU driver queries needed only by them,
+    and the frequency sampling when no enabled metric needs it
 * Metric output fixes:
   * `intel_xpu_info` exporter reported an empty subdevice ID, and aggregated
     memory modules of the same type on different subdevices
@@ -60,7 +73,11 @@ Contents:
     (also in the example config), including new `critical` states for the core and memory
     temperatures (memory temperature `warning` state replaced by `critical` one)
 * XPUMD binary reports the actual XPUMD version (instead of `0.0.0`)
-* XPUMD image: OS packages are from Ubuntu 24.04 instead of Debian (matching the driver stack packages), base image digests pinned
+* XPUMD image:
+  * Base image digest pinned
+  * The `xpumd` image now only contains the daemon, the stub Level-Zero driver and `xpuinfo-cli`
+    moved to the new `xpumd-devel` image variant
+  * The `xpumd-devel` image now includes also the `list-sysman` and `events-sysman` example apps from the level-zero-go bindings
 * Go dependencies: OTel collector update to v0.163.0 + other version updates
 
 

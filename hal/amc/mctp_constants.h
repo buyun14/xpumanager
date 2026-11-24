@@ -11,6 +11,8 @@
 #define MCTP_FAILURE 0x01
 #define MCTP_CANCELLED 0x02 // local status: a receive was abandoned at the caller's request
 #define MCTP_TIMEOUT 0x03	// local status: no message began to arrive within the time given
+// local status: a message began to arrive but was lost (DSP0236 drops an incomplete message)
+#define MCTP_DROPPED 0x04
 #define MCTP_HEADER_VERSION 0x01
 #define MCTP_HEADER_SIZE 0x09
 #define MCTP_HEADER_PEC_SIZE 0x01
@@ -28,8 +30,6 @@
 #define MCTP_RESPONSE 0x00
 
 #define MCTP_MAX_PAYLOAD_SIZE 20
-#define MCTP_MAX_RESPONSE_SIZE 32
-#define m_mctp_instance_id_MAX 32
 // mctp CONTROL CMD SIZE in bytes
 #define MCTP_SET_EID_CMD_SIZE 13
 #define MCTP_GET_EID_CMD_SIZE 11
@@ -54,8 +54,10 @@
 #define MCTP_SMBUS_SRC_ADDR_SIZE 1
 #define MCTP_SMBUS_FRAME_OVERHEAD 4 // destination slave address + command code + byte count + PEC
 #define MCTP_SMBUS_MAX_BYTE_COUNT (MCTP_SMBUS_SRC_ADDR_SIZE + MCTP_TRANSPORT_HDR_SIZE + MCTP_BASELINE_TRANSMISSION_UNIT)
-// Number of bytes requested per I2C read; one AMC frame plus the padding the AMC returns around it
-#define MCTP_SMBUS_READ_SIZE 128
+// Number of bytes requested per I2C read. A read starts at the command code, so the largest frame is
+// MCTP_SMBUS_MAX_BYTE_COUNT + 3 = 72 bytes; 73 is a full packet counted with its destination address byte. A
+// frame that starts part way into a read is completed by the next read.
+#define MCTP_SMBUS_READ_SIZE 73
 // Upper bound on a reassembled message; a local resource limit, not a protocol value
 #define MCTP_MAX_ASSEMBLED_MSG_SIZE 8192
 // Poll interval for the next packet of a message already being received; local pacing, not a protocol value
@@ -65,6 +67,17 @@
 // Gap between the packets of one message. The AMC's I2C target holds a single received
 // frame and drops it if the next write starts before its I2C thread has drained it.
 #define MCTP_INTER_PACKET_DELAY_MS 2
+// DSP0237 Table 9, MCTP control messages on SMBus. MT2, the wait for a response before retrying: at least
+// MT1 max + 2 * MT3 max (300 ms), at most MT4 min (5 s).
+#define MCTP_MT2_MS 1000
+// MN1, request retries: at least 2, and every try within MT4 (3 tries x MT2 = 3 s < 5 s)
+#define MCTP_MN1_RETRIES 2
+// MT4 min, the instance ID expiration interval: every try of a request goes out within it
+#define MCTP_MT4_MS 5000
+// Times a request is sent again when its response began to arrive but was lost (a damaged or cut-off
+// packet), on top of the MN1/PN1 retries and within MT4/PT3. Each costs one exchange, not an MT2 wait;
+// a local value, not a protocol one.
+#define MCTP_LOST_RESPONSE_RETRIES 8
 
 enum mctpControlCode
 {

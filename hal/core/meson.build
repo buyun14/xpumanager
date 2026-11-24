@@ -16,6 +16,7 @@ hal_core_sources = files(
   'firmware.cpp',
   'frequency.cpp',
   'memory.cpp',
+  'memory_vendor.cpp',
   'metric.cpp',
   'pci.cpp',
   'power.cpp',
@@ -53,9 +54,8 @@ if extensions_enabled
 else
   hal_core_sources += files('offline_page.cpp')
   hal_core_sources += files('powerexp.cpp')
-  hal_core_sources += files('memory_vendor.cpp')
-  hal_core_sources += files('cperlog.cpp')
 endif
+hal_core_sources += files('cperlog.cpp')
 
 # Shared library
 libxpum_shared = shared_library(
@@ -129,9 +129,11 @@ endif
 
 if get_option('with_tests')
   doctest_dep = dependency('doctest', required: true)
+  # Fake Level Zero temperature calls, shared with the health tests in ial/cmn/test.
+  fake_temperature_sysman_src = files('test/fake_temperature_sysman.cpp')
   temperature_test = executable(
     'temperature_test',
-    files('test/temperature_test.cpp'),
+    files('test/temperature_test.cpp') + fake_temperature_sysman_src,
     include_directories: [global_inc, hal_core_inc, oal_inc_dirs],
     link_with: libxpum_static,
     dependencies: [doctest_dep, levelzero_dep, igsc_dep, nlohmann_json_dep],
@@ -246,6 +248,8 @@ if get_option('with_tests')
         '-Wl,--wrap=zesFirmwareGetProperties',
         '-Wl,--wrap=zesFirmwareFlash',
         '-Wl,--wrap=zesDevicePciGetProperties',
+        '-Wl,--wrap=zesDriverGetExtensionProperties',
+        '-Wl,--wrap=zesDeviceGetState',
         '-Wl,--wrap=igsc_device_iterator_create',
         '-Wl,--wrap=igsc_device_iterator_next',
         '-Wl,--wrap=igsc_device_iterator_destroy',

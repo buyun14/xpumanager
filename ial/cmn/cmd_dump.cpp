@@ -5,6 +5,7 @@
  */
 
 #include "cmd_dump.h"
+#include "printer.h"
 #include "cmds.h"
 #include "utility/logger/logger.h"
 #include "device.h"
@@ -14,9 +15,11 @@
 #include <CLI/CLI.hpp>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -633,7 +636,7 @@ struct DumpOutput
 			if (hasEnvelope) {
 				obj["metrics"] = std::move(metricsHolder);
 			}
-			emit(obj.dump());
+			emit(jsonText(obj));
 			return;
 		}
 
@@ -700,6 +703,9 @@ private:
 	devInfo *currentDev{nullptr};
 };
 
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> gQueryQuit{false};
+
 /**
  * @brief Continuously re-sample metrics in loop mode for @c --query-gpu.
  *
@@ -723,6 +729,8 @@ private:
  * @note  The keyboard-input thread is started only for unlimited runs (@p count == 0)
  *        in interactive terminals. Finite-count runs skip the input thread so completion
  *        does not depend on keyboard input.
+ * @note  SIGINT and SIGTERM end the loop and return normally instead of killing the process,
+ *        so device teardown still runs (e.g. restoring the standby mode set at init).
  */
 ze_result_t runQueryLoopMode(DumpOutput out, std::span<const metrics::QueryMetric *> fields,
 							 std::vector<devInfo> &deviceList, std::vector<metrics::MetricCache> caches,
@@ -754,12 +762,33 @@ ze_result_t runQueryLoopMode(DumpOutput out, std::span<const metrics::QueryMetri
 		});
 	}
 
+	// Ctrl-C reaches us as SIGINT (getch() leaves ISIG on), so catch it rather than let the
+	// default action kill the process before device teardown runs.
+	gQueryQuit.store(false, std::memory_order_relaxed);
+	const auto sigHandler = [](int) { gQueryQuit.store(true, std::memory_order_relaxed); };
+	auto prevSigint = std::signal(SIGINT, sigHandler);
+	auto prevSigterm = std::signal(SIGTERM, sigHandler);
+	const auto quitRequested = [&quitToken] {
+		return quitToken.stop_requested() || gQueryQuit.load(std::memory_order_relaxed);
+	};
+
 	const std::size_t numDevices = deviceList.size();
 	const metrics::MetricInput inputs = metrics::inputsOf(fields);
+	constexpr auto pollSlice = std::chrono::milliseconds{100};
 
-	while (!quitToken.stop_requested()) {
+	while (!quitRequested()) {
 		xpum::watchdog::keepalive();
-		xpum::watchdog::sleepFor(loopInterval);
+		// Sleep in pollSlice chunks so SIGINT/SIGTERM is noticed promptly. watchdog::sleepFor
+		// keeps a long interval from counting as a stall.
+		const auto deadline = std::chrono::steady_clock::now() + loopInterval;
+		while (!quitRequested() && std::chrono::steady_clock::now() < deadline) {
+			const auto untilDeadline =
+				std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+			xpum::watchdog::sleepFor(std::min(untilDeadline, pollSlice));
+		}
+		if (quitRequested()) {
+			break;
+		}
 
 		const fdinfo::DeviceSnapshots fdNow = metrics::captureFdinfo(inputs);
 		for (std::size_t i = 0; i < numDevices; ++i) {
@@ -774,10 +803,19 @@ ze_result_t runQueryLoopMode(DumpOutput out, std::span<const metrics::QueryMetri
 		}
 	}
 
+	std::signal(SIGINT, prevSigint);
+	std::signal(SIGTERM, prevSigterm);
+
 	// Join before restoring the terminal: getch() calls tcsetattr on both entry and exit,
 	// so RESTORE_TERMINAL must not race with the input thread's own tcsetattr cleanup.
+	// After a signal the thread is still blocked in getch() waiting for a key, so joining
+	// would hang; detach it instead and let process exit reclaim it.
 	if (inputThread.joinable()) {
-		inputThread.join();
+		if (quitToken.stop_requested()) {
+			inputThread.join();
+		} else {
+			inputThread.detach();
+		}
 	}
 	if (shouldStartInputThread) {
 		RESTORE_TERMINAL();
@@ -856,6 +894,7 @@ ze_result_t runOutputLoop(DumpOutput out, std::span<const metrics::QueryMetric *
 	for (std::size_t i = 0; i < numDevices; ++i) {
 		metrics::populateMetricCacheEnd(deviceList[i], caches[i], &fdAfter);
 	}
+	metrics::discardMemBandwidthSpike(std::span<devInfo>(deviceList), std::span<metrics::MetricCache>(caches));
 
 	metrics::runMetricsWithCaches(out, std::span<const metrics::QueryMetric *>{fields}, std::span<devInfo>(deviceList),
 								  std::span<const metrics::MetricCache>{caches});
@@ -1091,6 +1130,7 @@ int cmdDump::runQuery(const std::string &metrics, const std::string &deviceSpec,
 		for (std::size_t i = 0; i < numDevices; ++i) {
 			metrics::populateMetricCacheEnd(deviceList[i], caches[i], &fdAfter);
 		}
+		metrics::discardMemBandwidthSpike(std::span<devInfo>(deviceList), std::span<metrics::MetricCache>(caches));
 	}
 	metrics::runMetricsWithCaches(out, std::span<const metrics::QueryMetric *>(fields), std::span<devInfo>(deviceList),
 								  std::span<const metrics::MetricCache>(caches));

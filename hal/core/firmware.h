@@ -27,10 +27,13 @@ private:
 	// Enumeration goes through the GSC over MEI and costs ~1 s per device as root on some
 	// platforms, so it runs on first use instead of in init().
 	zes_device_handle_t zesDevice = nullptr;
+	// Driver of zesDevice, needed to check which Sysman extensions it supports
+	zes_driver_handle_t zesDriver = nullptr;
 	bool enumerated = false;
 	ze_result_t enumResult = ZE_RESULT_SUCCESS;
 
 	[[nodiscard]] ze_result_t ensureEnumerated();
+	[[nodiscard]] ze_result_t checkFlashOverride(const firmwareInfo *fwInfo);
 
 	ze_result_t runUpdateSequence(updateFWCmdStruct &cmd, firmwareInfo *fwInfo);
 	ze_result_t updateComposite(firmwareInfo *fwInfo);
@@ -46,8 +49,10 @@ public:
 	ze_result_t getAmcSerialNumber(const char *bdfStr, char *serialNum, uint32_t size);
 	ze_result_t getAmcPartNumber(const char *bdfStr, char *partNum, uint32_t size);
 	ze_result_t getAmcTdp(const char *bdfStr, char *tdp, size_t *bufferSize);
+	ze_result_t getAmcTdpWatts(const char *bdfStr, uint32_t *watts);
 	int getAmcIndex(std::string gpuBdfStr);
 	bool hasAmcFirmware();
+	void setZesDriver(zes_driver_handle_t zesD) { zesDriver = zesD; }
 
 	ze_result_t init(zes_device_handle_t device) override;
 	ze_result_t zesRun(zes_device_handle_t device) override;

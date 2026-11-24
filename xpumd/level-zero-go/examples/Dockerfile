@@ -9,22 +9,12 @@
 ARG BACKEND=deb
 
 # driver stack DEB package versions
-ARG IGC_CORE_VERSION=2.41.5+22716
-ARG COMPUTE_RUNTIME_RELEASE=26.35.39758.10
-ARG LIBIGDGMM12_VERSION=22.10.0
+ARG IGC_CORE_VERSION=2.42.6+23070
+ARG COMPUTE_RUNTIME_RELEASE=26.40.40196.8
+ARG LIBIGDGMM12_VERSION=22.10.2
 ARG LEVEL_ZERO_VERSION=1.34.0
 
-# Go toolchain (self-contained, so it can be copied to the builder image)
-FROM golang:1.27-trixie AS go
-
-# The builder is Ubuntu (with common build tools), matching what the driver stack
-# packages are built for
-FROM buildpack-deps:24.04 AS builder
-
-COPY --from=go /usr/local/go/ /usr/local/go/
-ENV GOPATH=/go \
-    GOTOOLCHAIN=local \
-    PATH=/go/bin:/usr/local/go/bin:$PATH
+FROM golang:1.27-trixie AS builder
 
 ARG APP=list-sysman
 
@@ -114,13 +104,13 @@ FROM builder AS backend-deb
 # manifests/manifest.yml pins for that revision. The build args of this stage are
 # pinned by hack/vendor-intel-header.sh, together with the vendored headers, the ones
 # at the top of this file by hand.
-FROM buildpack-deps:24.04 AS backend-src
+FROM golang:1.27-trixie AS backend-src
 
-# Compute-runtime commit date 2026-08-25
-ARG COMPUTE_RUNTIME_COMMIT=9c2abbc844661895dc8c45ad84cdc50eb19e146c
-ARG LIBIGDGMM12_VERSION=22.10.0
-ARG LIBIGDGMM12_COMMIT=0246660b2ade17afc1c9c4c510368fa649ca809f
-ARG LEVEL_ZERO_VERSION=1.32.0
+# Compute-runtime commit date 2026-10-21
+ARG COMPUTE_RUNTIME_COMMIT=9b578ced3e1e40905d312e5e9b7bb4dd6d45f46e
+ARG LIBIGDGMM12_VERSION=22.10.2
+ARG LIBIGDGMM12_COMMIT=733c91a19baa65c40f4b1cf95a3991cc8c84d866
+ARG LEVEL_ZERO_VERSION=1.34.0
 
 # The Graphics Compiler is NOT taken from the manifest to avoid compiling it from sources, too.
 ARG IGC_CORE_VERSION=2.40.13+22418
@@ -184,7 +174,7 @@ RUN SRC=/src/gmmlib && BUILD=$SRC/build && \
     git -C $SRC checkout ${LIBIGDGMM12_COMMIT} && \
     cmake -G Ninja -Wno-dev -LH -S $SRC -B $BUILD \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_INSTALL_PREFIX=/usr/local && \
+          -DCMAKE_INSTALL_PREFIX=/usr && \
     ninja -C $BUILD && \
     ninja -C $BUILD install && \
     ldconfig

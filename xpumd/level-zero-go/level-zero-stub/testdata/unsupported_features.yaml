@@ -5,12 +5,21 @@ Drivers:
   - GetExtensionFunctionAddress
   - Driver.EventRegister
   - Driver.EventListenExp
+  - IntelInfoLogs
+  - IntelInfoLog.GetProperties
+  - IntelInfoLog.CreateInstance
+  - IntelInfoLogInstance.ReadWithMetadata
+  - IntelInfoLogInstance.PeekWithMetadata
+  - IntelInfoLogInstance.Delete
+  - Driver.GetProperties
+  - Driver.EventRegisterExt
+  - Driver.EventListenExt
   - InfoLogs
   - InfoLog.GetProperties
-  - InfoLog.Read
-  - InfoLog.ReadWithMetadata
-  - InfoLog.Enable
-  - InfoLog.Disable
+  - InfoLog.CreateInstance
+  - InfoLogInstance.ReadWithMetadata
+  - InfoLogInstance.PeekWithMetadata
+  - InfoLogInstance.Delete
   Devices:
   - UnsupportedFeatures:
     - Device.GetState

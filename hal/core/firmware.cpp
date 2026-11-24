@@ -5,9 +5,14 @@
  */
 
 #include "firmware.h"
+#include "extension_utils.h"
 #include <amcupd.h>
+#include <charconv>
+#include <cstring>
 #include <gscupd.h>
 #include <pldmextraction.h>
+#include <board_cache.h>
+#include <string>
 #include <sysmanupd.h>
 #include <tuple>
 #include <ze_api.h>
@@ -212,7 +217,9 @@ ze_result_t firmware::getProperties(zes_firmware_handle_t firmwareHandle)
  * @param bdfStr The BDF string of the device (e.g., "0000:00:02.0")
  * @param version Pointer to buffer to store the version string
  * @param size Size of the version buffer (currently unused)
- * @return ze_result_t ZE_RESULT_SUCCESS if version retrieved, error code otherwise
+ * @return ze_result_t ZE_RESULT_SUCCESS if version retrieved,
+ *         ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS if the AMC cannot be accessed by the caller,
+ *         error code otherwise
  */
 ze_result_t firmware::getFWversion(fwType type, const char *bdfStr, char *version, UNUSED uint32_t size)
 {
@@ -235,6 +242,9 @@ ze_result_t firmware::getFWversion(fwType type, const char *bdfStr, char *versio
 
 		if (fwupdArray && fwupdArray[FWUPD_PREFERENCE_AMC]) {
 			amcupd *a = static_cast<amcupd *>(fwupdArray[FWUPD_PREFERENCE_AMC]);
+			if (a->init() == ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS) {
+				return ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS;
+			}
 			// Along with the index, let's also find out the serial number and version of the AMC card
 			amc = a->amcGetCardInfo(bdfStr, amcSerialNum, amcVersion);
 
@@ -262,7 +272,8 @@ ze_result_t firmware::getFWversion(fwType type, const char *bdfStr, char *versio
  * @param[out] serialNum  Buffer to receive the null-terminated serial number string.
  * @param[in]  size       Size of serialNum buffer in bytes.
  * @return ZE_RESULT_SUCCESS on success, ZE_RESULT_ERROR_UNINITIALIZED when no AMC
- *         is registered for this device, ZE_RESULT_ERROR_NOT_AVAILABLE on lookup failure.
+ *         is registered for this device, ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS when the
+ *         caller cannot access the AMC, ZE_RESULT_ERROR_NOT_AVAILABLE on lookup failure.
  */
 ze_result_t firmware::getAmcSerialNumber(const char *bdfStr, char *serialNum, uint32_t size)
 {
@@ -278,6 +289,9 @@ ze_result_t firmware::getAmcSerialNumber(const char *bdfStr, char *serialNum, ui
 	amcupd *a = static_cast<amcupd *>(fwupdArray[FWUPD_PREFERENCE_AMC]);
 	if (a == nullptr) {
 		return ZE_RESULT_ERROR_UNINITIALIZED;
+	}
+	if (a->init() == ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS) {
+		return ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS;
 	}
 	const auto sn = a->amcGetSerialNumberByBdf(std::string(bdfStr));
 	if (!sn) {
@@ -298,6 +312,7 @@ ze_result_t firmware::getAmcSerialNumber(const char *bdfStr, char *serialNum, ui
  * @retval ZE_RESULT_SUCCESS                Part number retrieved successfully.
  * @retval ZE_RESULT_ERROR_UNINITIALIZED    No AMC entry present in fwupdArray or amcupd cast is null.
  * @retval ZE_RESULT_ERROR_INVALID_ARGUMENT Null pointer or zero-size buffer passed.
+ * @retval ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS The caller cannot access the AMC device.
  * @retval ZE_RESULT_ERROR_NOT_AVAILABLE    AMC init failure, BDF not found, or part number retrieval failed.
  */
 ze_result_t firmware::getAmcPartNumber(const char *bdfStr, char *partNum, uint32_t size)
@@ -315,6 +330,9 @@ ze_result_t firmware::getAmcPartNumber(const char *bdfStr, char *partNum, uint32
 	amcupd *a = static_cast<amcupd *>(fwupdArray[FWUPD_PREFERENCE_AMC]);
 	if (a == nullptr) {
 		return ZE_RESULT_ERROR_UNINITIALIZED;
+	}
+	if (a->init() == ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS) {
+		return ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS;
 	}
 
 	std::string pn;
@@ -397,6 +415,15 @@ ze_result_t firmware::runUpdateSequence(updateFWCmdStruct &cmd, firmwareInfo *fw
 		return ZE_RESULT_ERROR_UNKNOWN;
 	}
 
+	// The flash override image only goes to a device that is in flash override mode. This covers
+	// both -t FDO and the IFWI component of -t COMPOSITE --fdo, which is flashed through this row.
+	if (fwInfo->fwType == fwType::FDO) {
+		result = checkFlashOverride(fwInfo);
+		if (result != ZE_RESULT_SUCCESS) {
+			return result;
+		}
+	}
+
 	// Call the corresponding pre-update, firmware update and post-update functions in the hal
 	result = (fw->*cmd.preUpdateFunc)(fwInfo);
 	if (result != ZE_RESULT_SUCCESS) {
@@ -417,6 +444,66 @@ ze_result_t firmware::runUpdateSequence(updateFWCmdStruct &cmd, firmwareInfo *fw
 }
 
 /**
+ * @brief Confirms the device is in flash override (FDO) mode before the FDO image is flashed
+ *
+ * Reads the device state through zesDeviceGetState() with zes_device_ext_state_t chained on pNext
+ * and requires ZES_DEVICE_STATE_EXT_FLAG_FLASH_OVERRIDE. Some older drivers do not ignore an unknown
+ * pNext as the spec requires and crash on it, so the extension is only attached when the driver
+ * advertises ZES_DEVICE_EXT_STATE_NAME. When the mode cannot be confirmed the update is refused.
+ *
+ * @param [in] fwInfo Firmware information of the update, for the device index in messages
+ * @retval ZE_RESULT_SUCCESS                   The device is in flash override mode
+ * @retval ZE_RESULT_ERROR_UNSUPPORTED_FEATURE The driver does not report the extended device state
+ * @retval ZE_RESULT_ERROR_NOT_AVAILABLE       The device is not in flash override mode
+ * @retval Other                               The error from reading the device state
+ */
+ze_result_t firmware::checkFlashOverride(const firmwareInfo *fwInfo)
+{
+	TRACING();
+
+	if (zesDriver == nullptr || zesDevice == nullptr) {
+		ERR("Cannot confirm that device {} is in flash override mode: it has no Level Zero Sysman handle.\n",
+			fwInfo->deviceIndex);
+		return ZE_RESULT_ERROR_UNINITIALIZED;
+	}
+
+	const auto lookup = zes_ext::findExtensionVersion(zesDriver, ZES_DEVICE_EXT_STATE_NAME);
+	if (lookup.queryError != ZE_RESULT_SUCCESS) {
+		ERR("Cannot confirm that device {} is in flash override mode: failed to read the driver extensions. 0x{:X} "
+			"({})\n",
+			fwInfo->deviceIndex, static_cast<uint32_t>(lookup.queryError), l0_error_to_string(lookup.queryError));
+		return lookup.queryError;
+	}
+	if (!lookup.version.has_value()) {
+		ERR("Cannot confirm that device {} is in flash override mode: the Level Zero driver does not support {}.\n",
+			fwInfo->deviceIndex, ZES_DEVICE_EXT_STATE_NAME);
+		return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+	}
+
+	zes_device_ext_state_t extState{};
+	extState.stype = ZES_STRUCTURE_TYPE_DEVICE_EXT_STATE;
+	zes_device_state_t state{};
+	state.stype = ZES_STRUCTURE_TYPE_DEVICE_STATE;
+	state.pNext = &extState;
+	const ze_result_t result = zesDeviceGetState(zesDevice, &state);
+	if (result != ZE_RESULT_SUCCESS) {
+		ERR("Cannot confirm that device {} is in flash override mode: failed to get the device state. 0x{:X} ({})\n",
+			fwInfo->deviceIndex, static_cast<uint32_t>(result), l0_error_to_string(result));
+		return result;
+	}
+
+	DBG("Device {} extended state flags: 0x{:X}\n", fwInfo->deviceIndex, extState.flags);
+	if ((extState.flags & ZES_DEVICE_STATE_EXT_FLAG_FLASH_OVERRIDE) == 0) {
+		ERR("Device {} is not in flash override mode (device state flags 0x{:X}). An FDO image can only be flashed "
+			"to a device in flash override mode.\n",
+			fwInfo->deviceIndex, extState.flags);
+		return ZE_RESULT_ERROR_NOT_AVAILABLE;
+	}
+
+	return ZE_RESULT_SUCCESS;
+}
+
+/**
  * @brief Retrieve the Thermal Design Power (TDP) for the GPU identified by bdfStr.
  *
  * TDP is read from the FRU OTHER_INFORMATION field via the AMC FRU table (per DSP0257).
@@ -425,6 +512,7 @@ ze_result_t firmware::runUpdateSequence(updateFWCmdStruct &cmd, firmwareInfo *fw
  * @param[out] tdp        Buffer to receive the null-terminated TDP string, or nullptr to query length.
  * @param[in,out] bufferSize Pointer to buffer size; updated with required length on output.
  * @return ZE_RESULT_SUCCESS on success, ZE_RESULT_ERROR_UNINITIALIZED when no AMC is available,
+ *         ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS when the caller cannot access the AMC,
  *         ZE_RESULT_ERROR_NOT_AVAILABLE when TDP is not found in FRU data.
  */
 ze_result_t firmware::getAmcTdp(const char *bdfStr, char *tdp, size_t *bufferSize)
@@ -443,11 +531,80 @@ ze_result_t firmware::getAmcTdp(const char *bdfStr, char *tdp, size_t *bufferSiz
 	if (a == nullptr) {
 		return ZE_RESULT_ERROR_UNINITIALIZED;
 	}
+	if (a->init() == ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS) {
+		return ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS;
+	}
 
 	if (a->amcGetTdp(std::string(bdfStr), tdp, bufferSize) != AMC_SUCCESS) {
 		return ZE_RESULT_ERROR_NOT_AVAILABLE;
 	}
 
+	return ZE_RESULT_SUCCESS;
+}
+
+/**
+ * @brief Retrieve the Thermal Design Power (TDP) in watts for the GPU identified by bdfStr.
+ *
+ * The FRU OTHER_INFORMATION field holds the TDP as a hexadecimal string; this parses it.
+ *
+ * A TDP cached earlier in this boot for the same device instance is used without asking the AMC:
+ * the TDP of a card does not change, and an AMC in use by another process can take many seconds
+ * to answer, or not answer at all. A non-zero TDP read live from the AMC is cached for the rest of
+ * the boot. Nothing is cached on failure, so a busy AMC is asked again next time.
+ *
+ * @param[in]  bdfStr PCI BDF string of the GPU whose TDP is requested.
+ * @param[out] watts  TDP in watts.
+ * @return ZE_RESULT_SUCCESS on success, ZE_RESULT_ERROR_UNINITIALIZED when no AMC is available,
+ *         ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS when the caller cannot access the AMC and
+ *         nothing is cached, ZE_RESULT_ERROR_NOT_AVAILABLE when TDP is missing from FRU data or
+ *         is not valid hexadecimal.
+ */
+ze_result_t firmware::getAmcTdpWatts(const char *bdfStr, uint32_t *watts)
+{
+	TRACING();
+
+	if (!bdfStr || !watts) {
+		return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+	}
+	if (!fwupdArray || !fwupdArray[FWUPD_PREFERENCE_AMC]) {
+		return ZE_RESULT_ERROR_UNINITIALIZED;
+	}
+
+	if (const auto cached = loadCachedBoardValue(BoardValue::TdpWatts, bdfStr)) {
+		uint32_t value = 0;
+		const auto [ptr, ec] = std::from_chars(cached->data(), cached->data() + cached->size(), value);
+		if (ec == std::errc{} && ptr == cached->data() + cached->size() && value > 0) {
+			DBG("TDP of {} is from the cache: it was read from the AMC earlier in this boot\n", bdfStr);
+			*watts = value;
+			return ZE_RESULT_SUCCESS;
+		}
+		DBG("Ignoring invalid cached TDP '{}' for {}\n", *cached, bdfStr);
+	}
+
+	// Taken before the read, so a card replaced during it does not get this TDP cached
+	const auto cacheKey = currentBoardCacheKey(bdfStr);
+	char tdpBuf[MAX_PATH] = {};
+	size_t bufferSize = sizeof(tdpBuf);
+	ze_result_t result = getAmcTdp(bdfStr, tdpBuf, &bufferSize);
+	if (result != ZE_RESULT_SUCCESS) {
+		return result;
+	}
+	if (tdpBuf[0] == '\0') {
+		return ZE_RESULT_ERROR_NOT_AVAILABLE;
+	}
+
+	uint32_t value = 0;
+	const auto [ptr, ec] = std::from_chars(tdpBuf, tdpBuf + strlen(tdpBuf), value, 16);
+	if (ec != std::errc{} || *ptr != '\0') {
+		DBG("Invalid hexadecimal TDP '{}' from AMC FRU\n", tdpBuf);
+		return ZE_RESULT_ERROR_NOT_AVAILABLE;
+	}
+
+	*watts = value;
+	DBG("TDP of {} read live from the AMC\n", bdfStr);
+	if (cacheKey && value > 0) {
+		storeCachedBoardValue(BoardValue::TdpWatts, bdfStr, std::to_string(value), *cacheKey);
+	}
 	return ZE_RESULT_SUCCESS;
 }
 

@@ -49,8 +49,17 @@ static void *resolve_handle(const void *zes_handle, stub_handle_type_t expected_
 	if (expected_type == STUB_HANDLE_DRIVER)
 		return driver;
 
-	// Driver level components
-	if (expected_type == STUB_HANDLE_INFOLOG) {
+	// Driver level components. A collection instance of an info log has no state of
+	// its own, its handle resolves to the info log that it collects from.
+	if (expected_type == STUB_HANDLE_INTEL_INFOLOG || expected_type == STUB_HANDLE_INTEL_INFOLOG_INSTANCE) {
+		if (handle.bits.comp >= driver->intel_info_logs_count)
+			return NULL;
+		return &driver->intel_info_logs[handle.bits.comp];
+	}
+
+	// Collection instances of info logs have no state of their own, their handle
+	// resolves to the info log that they collect from.
+	if (expected_type == STUB_HANDLE_INFOLOG || expected_type == STUB_HANDLE_INFOLOG_INSTANCE) {
 		if (handle.bits.comp >= driver->info_logs_count)
 			return NULL;
 		return &driver->info_logs[handle.bits.comp];
@@ -130,6 +139,10 @@ static void *resolve_handle(const void *zes_handle, stub_handle_type_t expected_
 		if (handle.bits.comp >= device->temperature_sensors_count)
 			return NULL;
 		return &device->temperature_sensors[handle.bits.comp];
+	case STUB_HANDLE_VF:
+		if (handle.bits.comp >= device->vfs_count)
+			return NULL;
+		return &device->vfs[handle.bits.comp];
 	default:
 		return NULL;
 	}
@@ -144,7 +157,9 @@ static bool is_unsupported(const void *zes_handle, sysman_unsupported_feature_t 
 	sysman_drivers_state_t *drv = &system->drivers[handle.bits.drv];
 
 	// Driver features
-	if (handle.bits.type == STUB_HANDLE_DRIVER || handle.bits.type == STUB_HANDLE_INFOLOG) {
+	if (handle.bits.type == STUB_HANDLE_DRIVER || handle.bits.type == STUB_HANDLE_INTEL_INFOLOG ||
+		handle.bits.type == STUB_HANDLE_INTEL_INFOLOG_INSTANCE || handle.bits.type == STUB_HANDLE_INFOLOG ||
+		handle.bits.type == STUB_HANDLE_INFOLOG_INSTANCE) {
 		for (uint32_t i = 0; i < drv->unsupported_features_count; i++)
 			if (drv->unsupported_features[i] == flag)
 				return true;
@@ -197,6 +212,28 @@ ze_result_t zesDriverGet(uint32_t *pCount, zes_driver_handle_t *phDrivers)
 	return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
 }
 
+ze_result_t zesDriverGetProperties(zes_driver_handle_t hDriver, zes_driver_properties_t *pDriverProperties)
+{
+	sysman_state_lock();
+	sysman_drivers_state_t *drv = (sysman_drivers_state_t *)resolve_handle(hDriver, STUB_HANDLE_DRIVER);
+	if (!drv)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+	if (is_unsupported(hDriver, UNSUPPORTED_FEATURE_DRIVER_GET_PROPERTIES))
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	if (drv->return_values.zesDriverGetProperties)
+		return sysman_unlock_and_return(drv->return_values.zesDriverGetProperties);
+	if (!drv->properties)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	if (!pDriverProperties)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_POINTER);
+	zes_structure_type_t stype = pDriverProperties->stype;
+	void *pNext = pDriverProperties->pNext;
+	*pDriverProperties = drv->properties->base;
+	pDriverProperties->stype = stype;
+	pDriverProperties->pNext = pNext;
+	return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
+}
+
 ze_result_t zesDriverGetExtensionProperties(zes_driver_handle_t hDriver, uint32_t *pCount,
 											zes_driver_extension_properties_t *pExtensionProperties)
 {
@@ -243,10 +280,10 @@ ze_result_t zesDriverGetExtensionFunctionAddress(zes_driver_handle_t hDriver, co
 	} functions[] = {
 		{"zesIntelDriverEnumInfoLogsExp", (void *)zesIntelDriverEnumInfoLogsExp},
 		{"zesIntelInfoLogGetPropertiesExp", (void *)zesIntelInfoLogGetPropertiesExp},
-		{"zesIntelInfoLogReadExp", (void *)zesIntelInfoLogReadExp},
-		{"zesIntelInfoLogReadWithMetadataExp", (void *)zesIntelInfoLogReadWithMetadataExp},
-		{"zesIntelInfoLogEnableExp", (void *)zesIntelInfoLogEnableExp},
-		{"zesIntelInfoLogDisableExp", (void *)zesIntelInfoLogDisableExp},
+		{"zesIntelInfoLogInstanceReadWithMetadataExp", (void *)zesIntelInfoLogInstanceReadWithMetadataExp},
+		{"zesIntelInfoLogInstancePeekWithMetadataExp", (void *)zesIntelInfoLogInstancePeekWithMetadataExp},
+		{"zesIntelInfoLogCreateInstanceExp", (void *)zesIntelInfoLogCreateInstanceExp},
+		{"zesIntelInfoLogInstanceDeleteExp", (void *)zesIntelInfoLogInstanceDeleteExp},
 		{"zesIntelDriverEventRegisterExp", (void *)zesIntelDriverEventRegisterExp},
 		{"zesIntelDriverEventListenExp", (void *)zesIntelDriverEventListenExp},
 	};
@@ -1214,6 +1251,7 @@ typedef enum
 	EVENT_LISTEN_VARIANT_BASE, // zesDriverEventListen
 	EVENT_LISTEN_VARIANT_EX,   // zesDriverEventListenEx
 	EVENT_LISTEN_VARIANT_EXP,  // zesIntelDriverEventListenExp
+	EVENT_LISTEN_VARIANT_EXT,  // zesDriverEventListenExt
 } event_listen_variant_t;
 
 // Caller must hold g_state_lock.
@@ -1234,6 +1272,10 @@ static ze_result_t driver_event_listen_peek(ze_driver_handle_t hDriver, event_li
 	case EVENT_LISTEN_VARIANT_EXP:
 		feature = UNSUPPORTED_FEATURE_DRIVER_EVENT_LISTEN_EXP;
 		rv = drv->return_values.zesIntelDriverEventListenExp;
+		break;
+	case EVENT_LISTEN_VARIANT_EXT:
+		feature = UNSUPPORTED_FEATURE_DRIVER_EVENT_LISTEN_EXT;
+		rv = drv->return_values.zesDriverEventListenExt;
 		break;
 	case EVENT_LISTEN_VARIANT_BASE:
 	default:
@@ -1333,6 +1375,33 @@ ze_result_t zesDriverEventListenEx(ze_driver_handle_t hDriver, uint64_t timeout,
 	sysman_state_lock();
 	return sysman_unlock_and_return(driver_event_listen_poll(hDriver, EVENT_LISTEN_VARIANT_EX, timeout, count,
 															 phDevices, pNumDeviceEvents, pEvents, NULL));
+}
+
+ze_result_t zesDriverEventRegisterExt(zes_driver_handle_t hDriver, zes_event_type_flags_t events)
+{
+	sysman_state_lock();
+	sysman_drivers_state_t *drv = (sysman_drivers_state_t *)resolve_handle(hDriver, STUB_HANDLE_DRIVER);
+	if (!drv)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+	if (is_unsupported(hDriver, UNSUPPORTED_FEATURE_DRIVER_EVENT_REGISTER_EXT))
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	if (drv->return_values.zesDriverEventRegisterExt)
+		return sysman_unlock_and_return(drv->return_values.zesDriverEventRegisterExt);
+	// Only driver scoped events can be registered, the device ones are registered with zesDeviceEventRegister().
+	if (events & ~(zes_event_type_flags_t)ZES_EVENT_TYPE_FLAG_INFO_LOG_CPER_DATA_AVAILABLE_EXT)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_ENUMERATION);
+	return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
+}
+
+ze_result_t zesDriverEventListenExt(zes_driver_handle_t hDriver, uint64_t timeout, uint32_t count,
+									zes_device_handle_t *phDevices, uint32_t *pNumDeviceEvents,
+									zes_event_type_flags_t *pEvents, zes_event_type_flags_t *pDriverEvents)
+{
+	sysman_state_lock();
+	if (pDriverEvents)
+		*pDriverEvents = 0;
+	return sysman_unlock_and_return(driver_event_listen_poll(hDriver, EVENT_LISTEN_VARIANT_EXT, timeout, count,
+															 phDevices, pNumDeviceEvents, pEvents, pDriverEvents));
 }
 
 // ------------------------------------------------------------------
@@ -2639,6 +2708,108 @@ ze_result_t zesRasClearStateExp(zes_ras_handle_t hRas, zes_ras_error_category_ex
 }
 
 // ------------------------------------------------------------------
+// VF management
+// ------------------------------------------------------------------
+
+ze_result_t zesDeviceEnumEnabledVFExp(zes_device_handle_t hDevice, uint32_t *pCount, zes_vf_handle_t *phVFhandle)
+{
+	sysman_state_lock();
+	sysman_device_state_t *dev = (sysman_device_state_t *)resolve_handle(hDevice, STUB_HANDLE_DEVICE);
+	if (!dev)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+	if (is_unsupported(hDevice, UNSUPPORTED_FEATURE_VIRTUAL_FUNCTIONS))
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	if (dev->return_values.zesDeviceEnumEnabledVFExp)
+		return sysman_unlock_and_return(dev->return_values.zesDeviceEnumEnabledVFExp);
+	uint32_t n = dev->vfs_count;
+	if (!pCount)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_POINTER);
+	if (!phVFhandle) {
+		*pCount = n;
+		return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
+	}
+	n = (*pCount < n) ? *pCount : n;
+	stub_handle_t device_handle = decode_handle(hDevice);
+	for (uint32_t i = 0; i < n; i++)
+		phVFhandle[i] =
+			MAKE_COMPONENT_HANDLE(zes_vf_handle_t, STUB_HANDLE_VF, device_handle.bits.drv, device_handle.bits.dev, i);
+	*pCount = n;
+	return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
+}
+
+ze_result_t zesVFManagementGetVFCapabilitiesExp2(zes_vf_handle_t hVFhandle, zes_vf_exp2_capabilities_t *pCapability)
+{
+	sysman_state_lock();
+	sysman_vf_t *vf = (sysman_vf_t *)resolve_handle(hVFhandle, STUB_HANDLE_VF);
+	if (!vf)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+	if (is_unsupported(hVFhandle, UNSUPPORTED_FEATURE_VF_GET_CAPABILITIES_EXP2))
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	if (vf->return_values.zesVFManagementGetVFCapabilitiesExp2)
+		return sysman_unlock_and_return(vf->return_values.zesVFManagementGetVFCapabilitiesExp2);
+	if (!(vf->capabilities))
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	if (!pCapability)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_POINTER);
+	zes_structure_type_t stype = pCapability->stype;
+	void *pNext = pCapability->pNext;
+	*pCapability = *vf->capabilities;
+	pCapability->stype = stype;
+	pCapability->pNext = pNext;
+	return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
+}
+
+ze_result_t zesVFManagementGetVFMemoryUtilizationExp2(zes_vf_handle_t hVFhandle, uint32_t *pCount,
+													  zes_vf_util_mem_exp2_t *pMemUtil)
+{
+	sysman_state_lock();
+	sysman_vf_t *vf = (sysman_vf_t *)resolve_handle(hVFhandle, STUB_HANDLE_VF);
+	if (!vf)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+	if (is_unsupported(hVFhandle, UNSUPPORTED_FEATURE_VF_GET_MEMORY_UTILIZATION_EXP2))
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	if (vf->return_values.zesVFManagementGetVFMemoryUtilizationExp2)
+		return sysman_unlock_and_return(vf->return_values.zesVFManagementGetVFMemoryUtilizationExp2);
+	if (!pCount)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_POINTER);
+	uint32_t n = vf->memory_utilization_count;
+	if (!pMemUtil) {
+		*pCount = n;
+		return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
+	}
+	n = (*pCount < n) ? *pCount : n;
+	for (uint32_t i = 0; i < n; i++)
+		pMemUtil[i] = vf->memory_utilization[i];
+	*pCount = n;
+	return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
+}
+
+ze_result_t zesVFManagementGetVFEngineUtilizationExp2(zes_vf_handle_t hVFhandle, uint32_t *pCount,
+													  zes_vf_util_engine_exp2_t *pEngineUtil)
+{
+	sysman_state_lock();
+	sysman_vf_t *vf = (sysman_vf_t *)resolve_handle(hVFhandle, STUB_HANDLE_VF);
+	if (!vf)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+	if (is_unsupported(hVFhandle, UNSUPPORTED_FEATURE_VF_GET_ENGINE_UTILIZATION_EXP2))
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	if (vf->return_values.zesVFManagementGetVFEngineUtilizationExp2)
+		return sysman_unlock_and_return(vf->return_values.zesVFManagementGetVFEngineUtilizationExp2);
+	if (!pCount)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_POINTER);
+	uint32_t n = vf->engine_utilization_count;
+	if (!pEngineUtil) {
+		*pCount = n;
+		return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
+	}
+	n = (*pCount < n) ? *pCount : n;
+	for (uint32_t i = 0; i < n; i++)
+		pEngineUtil[i] = vf->engine_utilization[i];
+	*pCount = n;
+	return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
+}
+
+// ------------------------------------------------------------------
 // Schedulers
 // ------------------------------------------------------------------
 
@@ -3003,11 +3174,11 @@ ze_result_t zesIntelDriverEnumInfoLogsExp(zes_driver_handle_t hDriver, uint32_t 
 	sysman_drivers_state_t *drv = (sysman_drivers_state_t *)resolve_handle(hDriver, STUB_HANDLE_DRIVER);
 	if (!drv)
 		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
-	if (is_unsupported(hDriver, UNSUPPORTED_FEATURE_INFO_LOGS))
+	if (is_unsupported(hDriver, UNSUPPORTED_FEATURE_INTEL_INFO_LOGS))
 		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
 	if (drv->return_values.zesIntelDriverEnumInfoLogsExp)
 		return sysman_unlock_and_return(drv->return_values.zesIntelDriverEnumInfoLogsExp);
-	uint32_t n = drv->info_logs_count;
+	uint32_t n = drv->intel_info_logs_count;
 	if (!pCount)
 		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_POINTER);
 	if (!phInfoLogs || *pCount == 0) {
@@ -3018,7 +3189,7 @@ ze_result_t zesIntelDriverEnumInfoLogsExp(zes_driver_handle_t hDriver, uint32_t 
 	stub_handle_t driver_handle = decode_handle(hDriver);
 	for (uint32_t i = 0; i < n; i++)
 		phInfoLogs[i] =
-			MAKE_COMPONENT_HANDLE(zes_intel_info_log_handle_t, STUB_HANDLE_INFOLOG, driver_handle.bits.drv, 0, i);
+			MAKE_COMPONENT_HANDLE(zes_intel_info_log_handle_t, STUB_HANDLE_INTEL_INFOLOG, driver_handle.bits.drv, 0, i);
 	*pCount = n;
 	return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
 }
@@ -3027,10 +3198,10 @@ ze_result_t zesIntelInfoLogGetPropertiesExp(zes_intel_info_log_handle_t hInfoLog
 											zes_intel_info_log_properties_exp_t *pProperties)
 {
 	sysman_state_lock();
-	sysman_info_log_t *log = (sysman_info_log_t *)resolve_handle(hInfoLog, STUB_HANDLE_INFOLOG);
+	sysman_intel_info_log_t *log = (sysman_intel_info_log_t *)resolve_handle(hInfoLog, STUB_HANDLE_INTEL_INFOLOG);
 	if (!log)
 		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
-	if (is_unsupported(hInfoLog, UNSUPPORTED_FEATURE_INFO_LOG_GET_PROPERTIES))
+	if (is_unsupported(hInfoLog, UNSUPPORTED_FEATURE_INTEL_INFO_LOG_GET_PROPERTIES))
 		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
 	if (log->return_values.zesIntelInfoLogGetPropertiesExp)
 		return sysman_unlock_and_return(log->return_values.zesIntelInfoLogGetPropertiesExp);
@@ -3046,123 +3217,350 @@ ze_result_t zesIntelInfoLogGetPropertiesExp(zes_intel_info_log_handle_t hInfoLog
 	return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
 }
 
-ze_result_t zesIntelInfoLogReadExp(zes_intel_info_log_handle_t hInfoLog, uint32_t *pSize, uint8_t *pBuffer)
+// Collects the records that log holds, always starting from the first one. Shared
+// by zesIntelInfoLogInstanceReadWithMetadataExp() and
+// zesIntelInfoLogInstancePeekWithMetadataExp().
+static ze_result_t intel_info_log_collect(sysman_intel_info_log_t *log, uint64_t timeout, uint32_t *pSize,
+										  uint8_t *pBuffer, uint32_t *pRecordCount,
+										  zes_intel_info_log_metadata_exp *pDescriptors,
+										  zes_intel_info_log_read_status_exp_t *pReadStatus)
 {
-	sysman_state_lock();
-	sysman_info_log_t *log = (sysman_info_log_t *)resolve_handle(hInfoLog, STUB_HANDLE_INFOLOG);
-	if (!log)
-		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
-	if (is_unsupported(hInfoLog, UNSUPPORTED_FEATURE_INFO_LOG_READ))
-		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
-	// A configured warning is returned with the data, like the backend driver
-	// does when it had to drop records that did not fit in the buffer.
-	ze_result_t ret = log->return_values.zesIntelInfoLogReadExp;
-	if (ret != ZE_RESULT_SUCCESS && ret != ZE_RESULT_WARNING_DROPPED_DATA)
-		return sysman_unlock_and_return(ret);
+	if (!pSize || !pRecordCount)
+		return ZE_RESULT_ERROR_INVALID_NULL_POINTER;
+	// A call without room for both the data and the metadata only reports the totals
+	bool query = (*pSize == 0 || *pRecordCount == 0);
+	if (!query && (!pBuffer || !pDescriptors))
+		return ZE_RESULT_ERROR_INVALID_ARGUMENT;
 
-	if (!pSize || !pBuffer || *pSize == 0)
-		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_ARGUMENT);
-
-	// Only whole records are read. Unlike the backend driver, the stub does not
-	// consume the records: reading always starts from the first one.
-	// NOTE: unlike the records from the real driver, the records from the stub
-	// are null-terminated strings (from its config)
-	uint32_t size = 0;
-	for (uint32_t i = 0; i < log->records_count; i++) {
-		const char *record = log->records[i].data;
-		size_t len = sysman_strnlen(record, SYSMAN_INFO_LOG_RECORD_SIZE);
-		if (len > (size_t)(*pSize - size))
-			break;
-		memcpy(pBuffer + size, record, len);
-		size += (uint32_t)len;
-	}
-	*pSize = size;
-	return sysman_unlock_and_return(ret);
-}
-
-ze_result_t zesIntelInfoLogReadWithMetadataExp(zes_intel_info_log_handle_t hInfoLog, uint32_t *pSize, uint8_t *pBuffer,
-											   uint32_t *pEventCount, zes_intel_info_log_metadata_exp *pDescriptors)
-{
-	sysman_state_lock();
-	sysman_info_log_t *log = (sysman_info_log_t *)resolve_handle(hInfoLog, STUB_HANDLE_INFOLOG);
-	if (!log)
-		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
-	if (is_unsupported(hInfoLog, UNSUPPORTED_FEATURE_INFO_LOG_READ_WITH_METADATA))
-		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
-	// A configured warning is returned with the data, see zesIntelInfoLogReadExp()
-	ze_result_t ret = log->return_values.zesIntelInfoLogReadWithMetadataExp;
-	if (ret != ZE_RESULT_SUCCESS && ret != ZE_RESULT_WARNING_DROPPED_DATA)
-		return sysman_unlock_and_return(ret);
-	if (!pSize || !pEventCount)
-		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_ARGUMENT);
-
-	// Without both output buffers, only size of pending data is returned.
-	// NOTE: unlike the records from the real driver, the records from the stub
-	// are null-terminated strings (from its config)
-	if (!pBuffer || !pDescriptors) {
-		uint32_t pending = 0;
-		for (uint32_t i = 0; i < log->records_count; i++)
-			pending += (uint32_t)sysman_strnlen(log->records[i].data, SYSMAN_INFO_LOG_RECORD_SIZE);
-		*pSize = pending;
-		*pEventCount = log->records_count;
-		return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
-	}
-
-	// Only whole records are read and the stub does not consume them.
 	uint32_t size = 0;
 	uint32_t count = 0;
-	for (uint32_t i = 0; i < log->records_count && count < *pEventCount; i++) {
-		const sysman_info_log_record_t *record = &log->records[i];
-		size_t len = sysman_strnlen(record->data, SYSMAN_INFO_LOG_RECORD_SIZE);
-		if (len > (size_t)(*pSize - size))
-			break;
-		memcpy(pBuffer + size, record->data, len);
+	// A log without a collection hands out nothing, with a zeroed status
+	const sysman_intel_info_log_collection_t *collection = log->collection;
 
-		zes_structure_type_ext_t stype = pDescriptors[count].stype;
-		void *pNext = pDescriptors[count].pNext;
-		pDescriptors[count] = record->metadata;
-		pDescriptors[count].stype = stype;
-		pDescriptors[count].pNext = pNext;
-		// The location of the record in the buffer is not configured but computed
-		pDescriptors[count].offset = size;
-		pDescriptors[count].lengthOfData = (uint32_t)len;
+	// A zero timeout returns immediately, without searching for records
+	if (collection && timeout > 0) {
+		for (uint32_t i = 0; i < collection->records_count; i++) {
+			const sysman_intel_info_log_record_t *record = &collection->records[i];
+			// NOTE: unlike the records from the real driver, the records from the stub
+			// are null-terminated strings (from its config)
+			uint32_t len = (uint32_t)sysman_strnlen(record->data, SYSMAN_INFO_LOG_RECORD_SIZE);
+			// A query call reports the totals of the records held
+			if (query) {
+				size += len;
+				count++;
+				continue;
+			}
+			// Records are handed out whole, one that does not fit is left out
+			if (count >= *pRecordCount || len > *pSize - size)
+				break;
+			memcpy(pBuffer + size, record->data, len);
 
-		size += (uint32_t)len;
-		count++;
+			zes_structure_type_ext_t stype = pDescriptors[count].stype;
+			void *pNext = pDescriptors[count].pNext;
+			pDescriptors[count] = record->metadata;
+			pDescriptors[count].stype = stype;
+			pDescriptors[count].pNext = pNext;
+			// The location of the record in the buffer is not configured but computed
+			pDescriptors[count].offset = size;
+			pDescriptors[count].lengthOfData = len;
+
+			size += len;
+			count++;
+		}
 	}
 	*pSize = size;
-	*pEventCount = count;
-	return sysman_unlock_and_return(ret);
+	*pRecordCount = count;
+
+	// The status is returned as configured, nothing in it is derived from the records
+	if (pReadStatus) {
+		zes_structure_type_ext_t stype = pReadStatus->stype;
+		void *pNext = pReadStatus->pNext;
+		if (collection && collection->status)
+			*pReadStatus = *collection->status;
+		else
+			memset(pReadStatus, 0, sizeof(*pReadStatus));
+		pReadStatus->stype = stype;
+		pReadStatus->pNext = pNext;
+	}
+	return ZE_RESULT_SUCCESS;
 }
 
-ze_result_t zesIntelInfoLogEnableExp(zes_intel_info_log_handle_t hInfoLog,
-									 zes_intel_info_log_enable_descriptor_exp *pEnableDescriptor)
+ze_result_t zesIntelInfoLogInstanceReadWithMetadataExp(zes_intel_info_log_instance_handle_t hInfoLogInstance,
+													   uint64_t timeout, uint32_t *pSize, uint8_t *pBuffer,
+													   uint32_t *pRecordCount,
+													   zes_intel_info_log_metadata_exp *pDescriptors,
+													   zes_intel_info_log_read_status_exp_t *pReadStatus)
 {
 	sysman_state_lock();
-	sysman_info_log_t *log = (sysman_info_log_t *)resolve_handle(hInfoLog, STUB_HANDLE_INFOLOG);
+	sysman_intel_info_log_t *log =
+		(sysman_intel_info_log_t *)resolve_handle(hInfoLogInstance, STUB_HANDLE_INTEL_INFOLOG_INSTANCE);
 	if (!log)
 		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
-	if (is_unsupported(hInfoLog, UNSUPPORTED_FEATURE_INFO_LOG_ENABLE))
+	if (is_unsupported(hInfoLogInstance, UNSUPPORTED_FEATURE_INTEL_INFO_LOG_INSTANCE_READ))
 		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
-	if (log->return_values.zesIntelInfoLogEnableExp)
-		return sysman_unlock_and_return(log->return_values.zesIntelInfoLogEnableExp);
-	if (!pEnableDescriptor)
+	if (log->return_values.zesIntelInfoLogInstanceReadWithMetadataExp)
+		return sysman_unlock_and_return(log->return_values.zesIntelInfoLogInstanceReadWithMetadataExp);
+	return sysman_unlock_and_return(
+		intel_info_log_collect(log, timeout, pSize, pBuffer, pRecordCount, pDescriptors, pReadStatus));
+}
+
+ze_result_t zesIntelInfoLogInstancePeekWithMetadataExp(zes_intel_info_log_instance_handle_t hInfoLogInstance,
+													   uint64_t timeout, uint32_t *pSize, uint8_t *pBuffer,
+													   uint32_t *pRecordCount,
+													   zes_intel_info_log_metadata_exp *pDescriptors,
+													   zes_intel_info_log_read_status_exp_t *pReadStatus)
+{
+	sysman_state_lock();
+	sysman_intel_info_log_t *log =
+		(sysman_intel_info_log_t *)resolve_handle(hInfoLogInstance, STUB_HANDLE_INTEL_INFOLOG_INSTANCE);
+	if (!log)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+	if (is_unsupported(hInfoLogInstance, UNSUPPORTED_FEATURE_INTEL_INFO_LOG_INSTANCE_PEEK))
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	if (log->return_values.zesIntelInfoLogInstancePeekWithMetadataExp)
+		return sysman_unlock_and_return(log->return_values.zesIntelInfoLogInstancePeekWithMetadataExp);
+	return sysman_unlock_and_return(
+		intel_info_log_collect(log, timeout, pSize, pBuffer, pRecordCount, pDescriptors, pReadStatus));
+}
+
+ze_result_t zesIntelInfoLogCreateInstanceExp(zes_intel_info_log_handle_t hInfoLog, const char *pInstanceName,
+											 zes_intel_info_log_instance_exp_desc_t *pDesc,
+											 zes_intel_info_log_instance_handle_t *phInfoLogInstance)
+{
+	sysman_state_lock();
+	(void)pInstanceName;
+	sysman_intel_info_log_t *log = (sysman_intel_info_log_t *)resolve_handle(hInfoLog, STUB_HANDLE_INTEL_INFOLOG);
+	if (!log)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+	if (is_unsupported(hInfoLog, UNSUPPORTED_FEATURE_INTEL_INFO_LOG_CREATE_INSTANCE))
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	if (log->return_values.zesIntelInfoLogCreateInstanceExp)
+		return sysman_unlock_and_return(log->return_values.zesIntelInfoLogCreateInstanceExp);
+	if (!pDesc || !phInfoLogInstance)
 		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_POINTER);
-	// NOTE: The requested configuration is accepted as is, input args are not modified
-	// (i.e. rounding/setting the values to what is supported like the real backend driver does)
+	// NOTE: the requested configuration is accepted as is, only the applied buffer
+	// size is reported back, and only when one is configured
+	if (pDesc->pBufferSize && log->buffer_size_in_kb)
+		*pDesc->pBufferSize = log->buffer_size_in_kb;
+
+	stub_handle_t info_log_handle = decode_handle(hInfoLog);
+	*phInfoLogInstance = MAKE_COMPONENT_HANDLE(zes_intel_info_log_instance_handle_t, STUB_HANDLE_INTEL_INFOLOG_INSTANCE,
+											   info_log_handle.bits.drv, 0, info_log_handle.bits.comp);
 	return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
 }
 
-ze_result_t zesIntelInfoLogDisableExp(zes_intel_info_log_handle_t hInfoLog)
+ze_result_t zesIntelInfoLogInstanceDeleteExp(zes_intel_info_log_instance_handle_t hInfoLogInstance)
+{
+	sysman_state_lock();
+	sysman_intel_info_log_t *log =
+		(sysman_intel_info_log_t *)resolve_handle(hInfoLogInstance, STUB_HANDLE_INTEL_INFOLOG_INSTANCE);
+	if (!log)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+	if (is_unsupported(hInfoLogInstance, UNSUPPORTED_FEATURE_INTEL_INFO_LOG_INSTANCE_DELETE))
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	if (log->return_values.zesIntelInfoLogInstanceDeleteExp)
+		return sysman_unlock_and_return(log->return_values.zesIntelInfoLogInstanceDeleteExp);
+	return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
+}
+
+// ------------------------------------------------------------------
+// Info logs
+// ------------------------------------------------------------------
+
+ze_result_t zesDriverEnumInfoLogsExt(zes_driver_handle_t hDriver, uint32_t *pCount, zes_info_log_handle_t *phInfoLogs)
+{
+	sysman_state_lock();
+	sysman_drivers_state_t *drv = (sysman_drivers_state_t *)resolve_handle(hDriver, STUB_HANDLE_DRIVER);
+	if (!drv)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+	if (is_unsupported(hDriver, UNSUPPORTED_FEATURE_INFO_LOGS))
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	if (drv->return_values.zesDriverEnumInfoLogsExt)
+		return sysman_unlock_and_return(drv->return_values.zesDriverEnumInfoLogsExt);
+	uint32_t n = drv->info_logs_count;
+	if (!pCount)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_POINTER);
+	if (!phInfoLogs || *pCount == 0) {
+		*pCount = n;
+		return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
+	}
+	n = (*pCount < n) ? *pCount : n;
+	stub_handle_t driver_handle = decode_handle(hDriver);
+	for (uint32_t i = 0; i < n; i++)
+		phInfoLogs[i] = MAKE_COMPONENT_HANDLE(zes_info_log_handle_t, STUB_HANDLE_INFOLOG, driver_handle.bits.drv, 0, i);
+	*pCount = n;
+	return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
+}
+
+ze_result_t zesInfoLogGetPropertiesExt(zes_info_log_handle_t hInfoLog, zes_info_log_ext_properties_t *pProperties)
 {
 	sysman_state_lock();
 	sysman_info_log_t *log = (sysman_info_log_t *)resolve_handle(hInfoLog, STUB_HANDLE_INFOLOG);
 	if (!log)
 		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
-	if (is_unsupported(hInfoLog, UNSUPPORTED_FEATURE_INFO_LOG_DISABLE))
+	if (is_unsupported(hInfoLog, UNSUPPORTED_FEATURE_INFO_LOG_GET_PROPERTIES))
 		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
-	if (log->return_values.zesIntelInfoLogDisableExp)
-		return sysman_unlock_and_return(log->return_values.zesIntelInfoLogDisableExp);
+	if (log->return_values.zesInfoLogGetPropertiesExt)
+		return sysman_unlock_and_return(log->return_values.zesInfoLogGetPropertiesExt);
+	if (!log->properties)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	if (!pProperties)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_POINTER);
+	zes_structure_type_t stype = pProperties->stype;
+	void *pNext = pProperties->pNext;
+	*pProperties = *log->properties;
+	pProperties->stype = stype;
+	pProperties->pNext = pNext;
+	return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
+}
+
+ze_result_t zesInfoLogCreateInstanceExt(zes_info_log_handle_t hInfoLog, const char *pInstanceName,
+										zes_info_log_instance_ext_desc_t *pDesc,
+										zes_info_log_instance_handle_t *phInfoLogInstance)
+{
+	sysman_state_lock();
+	(void)pInstanceName;
+	sysman_info_log_t *log = (sysman_info_log_t *)resolve_handle(hInfoLog, STUB_HANDLE_INFOLOG);
+	if (!log)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+	if (is_unsupported(hInfoLog, UNSUPPORTED_FEATURE_INFO_LOG_CREATE_INSTANCE))
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	if (log->return_values.zesInfoLogCreateInstanceExt)
+		return sysman_unlock_and_return(log->return_values.zesInfoLogCreateInstanceExt);
+	if (!pDesc || !phInfoLogInstance)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_POINTER);
+	// NOTE: the requested configuration is accepted as is, only the applied buffer
+	// size is reported back, and only when one is configured
+	if (pDesc->pBufferSizeInKb && log->buffer_size_in_kb)
+		*pDesc->pBufferSizeInKb = log->buffer_size_in_kb;
+
+	stub_handle_t info_log_handle = decode_handle(hInfoLog);
+	*phInfoLogInstance = MAKE_COMPONENT_HANDLE(zes_info_log_instance_handle_t, STUB_HANDLE_INFOLOG_INSTANCE,
+											   info_log_handle.bits.drv, 0, info_log_handle.bits.comp);
+	return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
+}
+
+// Collects the records that log holds, always starting from the first one. Shared
+// by zesInfoLogInstanceReadWithMetadataExt() and zesInfoLogInstancePeekWithMetadataExt().
+static ze_result_t info_log_collect(sysman_info_log_t *log, uint64_t timeout, uint32_t *pSize, uint8_t *pBuffer,
+									uint32_t *pRecordCount, zes_info_log_metadata_ext_t *pDescriptors,
+									zes_info_log_read_status_ext_t *pReadStatus)
+{
+	if (!pSize || !pRecordCount)
+		return ZE_RESULT_ERROR_INVALID_NULL_POINTER;
+	// A call without room for both the data and the metadata only reports the totals
+	bool query = (*pSize == 0 || *pRecordCount == 0);
+	if (!query && (!pBuffer || !pDescriptors))
+		return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+
+	uint32_t size = 0;
+	uint32_t count = 0;
+	// A log without a collection hands out nothing, with a zeroed status
+	const sysman_info_log_collection_t *collection = log->collection;
+
+	// A zero timeout returns immediately, without searching for records
+	if (collection && timeout > 0) {
+		for (uint32_t i = 0; i < collection->records_count; i++) {
+			const sysman_info_log_record_t *record = &collection->records[i];
+			// NOTE: unlike the records from the real driver, the records from the stub
+			// are null-terminated strings (from its config)
+			uint32_t len = (uint32_t)sysman_strnlen(record->data, SYSMAN_INFO_LOG_RECORD_SIZE);
+			// A query call reports the totals of the records held
+			if (query) {
+				size += len;
+				count++;
+				continue;
+			}
+			// Records are handed out whole, one that does not fit is left out
+			if (count >= *pRecordCount || len > *pSize - size)
+				break;
+			memcpy(pBuffer + size, record->data, len);
+
+			zes_structure_type_t stype = pDescriptors[count].stype;
+			void *pNext = pDescriptors[count].pNext;
+			pDescriptors[count] = record->metadata;
+			pDescriptors[count].stype = stype;
+			pDescriptors[count].pNext = pNext;
+			// The location of the record in the buffer is not configured but computed
+			pDescriptors[count].offset = size;
+			pDescriptors[count].lengthOfData = len;
+
+			size += len;
+			count++;
+		}
+	}
+	*pSize = size;
+	*pRecordCount = count;
+
+	// The status is returned as configured, nothing in it is derived from the records
+	if (pReadStatus) {
+		zes_structure_type_t stype = pReadStatus->stype;
+		void *pNext = pReadStatus->pNext;
+		if (collection && collection->status)
+			*pReadStatus = *collection->status;
+		else
+			memset(pReadStatus, 0, sizeof(*pReadStatus));
+		pReadStatus->stype = stype;
+		pReadStatus->pNext = pNext;
+	}
+	return ZE_RESULT_SUCCESS;
+}
+
+static ze_result_t info_log_collect_rv(sysman_info_log_t *log, ze_result_t rv, uint64_t timeout, uint32_t *pSize,
+									   uint8_t *pBuffer, uint32_t *pRecordCount,
+									   zes_info_log_metadata_ext_t *pDescriptors,
+									   zes_info_log_read_status_ext_t *pReadStatus)
+{
+	// A configured ZE_RESULT_WARNING_DROPPED_DATA is returned together with the records, as it is the only way to
+	// report the droppedRecordCount of the status.
+	if (rv != ZE_RESULT_SUCCESS && rv != ZE_RESULT_WARNING_DROPPED_DATA)
+		return rv;
+	ze_result_t ret = info_log_collect(log, timeout, pSize, pBuffer, pRecordCount, pDescriptors, pReadStatus);
+	return ret != ZE_RESULT_SUCCESS ? ret : rv;
+}
+
+ze_result_t zesInfoLogInstanceReadWithMetadataExt(zes_info_log_instance_handle_t hInfoLogInstance, uint64_t timeout,
+												  uint32_t *pSize, uint8_t *pBuffer, uint32_t *pRecordCount,
+												  zes_info_log_metadata_ext_t *pDescriptors,
+												  zes_info_log_read_status_ext_t *pReadStatus)
+{
+	sysman_state_lock();
+	sysman_info_log_t *log = (sysman_info_log_t *)resolve_handle(hInfoLogInstance, STUB_HANDLE_INFOLOG_INSTANCE);
+	if (!log)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+	if (is_unsupported(hInfoLogInstance, UNSUPPORTED_FEATURE_INFO_LOG_INSTANCE_READ))
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	return sysman_unlock_and_return(info_log_collect_rv(log, log->return_values.zesInfoLogInstanceReadWithMetadataExt,
+														timeout, pSize, pBuffer, pRecordCount, pDescriptors,
+														pReadStatus));
+}
+
+ze_result_t zesInfoLogInstancePeekWithMetadataExt(zes_info_log_instance_handle_t hInfoLogInstance, uint64_t timeout,
+												  uint32_t *pSize, uint8_t *pBuffer, uint32_t *pRecordCount,
+												  zes_info_log_metadata_ext_t *pDescriptors,
+												  zes_info_log_read_status_ext_t *pReadStatus)
+{
+	sysman_state_lock();
+	sysman_info_log_t *log = (sysman_info_log_t *)resolve_handle(hInfoLogInstance, STUB_HANDLE_INFOLOG_INSTANCE);
+	if (!log)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+	if (is_unsupported(hInfoLogInstance, UNSUPPORTED_FEATURE_INFO_LOG_INSTANCE_PEEK))
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	return sysman_unlock_and_return(info_log_collect_rv(log, log->return_values.zesInfoLogInstancePeekWithMetadataExt,
+														timeout, pSize, pBuffer, pRecordCount, pDescriptors,
+														pReadStatus));
+}
+
+ze_result_t zesInfoLogInstanceDeleteExt(zes_info_log_instance_handle_t hInfoLogInstance)
+{
+	sysman_state_lock();
+	sysman_info_log_t *log = (sysman_info_log_t *)resolve_handle(hInfoLogInstance, STUB_HANDLE_INFOLOG_INSTANCE);
+	if (!log)
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_INVALID_NULL_HANDLE);
+	if (is_unsupported(hInfoLogInstance, UNSUPPORTED_FEATURE_INFO_LOG_INSTANCE_DELETE))
+		return sysman_unlock_and_return(ZE_RESULT_ERROR_UNSUPPORTED_FEATURE);
+	if (log->return_values.zesInfoLogInstanceDeleteExt)
+		return sysman_unlock_and_return(log->return_values.zesInfoLogInstanceDeleteExt);
 	return sysman_unlock_and_return(ZE_RESULT_SUCCESS);
 }
 

@@ -7,9 +7,17 @@
 Drivers:
   - ExtensionProperties: []
     Events: 0
+    IntelInfoLogs:
+      - Properties: {}
+        Collection:
+          Status: {}
+          Records: []
+    Properties: {}
     InfoLogs:
       - Properties: {}
-        Records: []
+        Collection:
+          Status: {}
+          Records: []
     Devices:
       - Properties: {}
         State: {}
@@ -89,6 +97,10 @@ Drivers:
           - Properties: {}
             Config: {}
             State: {}
+        VirtualFunctions:
+          - Capabilities: {}
+            MemoryUtilization: []
+            EngineUtilization: []
         Schedulers:
           - Properties: {}
             CurrentMode: 1

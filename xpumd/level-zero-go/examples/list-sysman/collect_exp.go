@@ -9,39 +9,11 @@ package main
 
 import (
 	"encoding/hex"
-	"errors"
-	"flag"
-	"fmt"
 
-	"github.com/intel/level-zero-go/examples/common"
 	"github.com/intel/level-zero-go/sysman"
 	"github.com/intel/level-zero-go/sysman/exp"
 	"github.com/intel/level-zero-go/sysman/exp/intel"
 )
-
-const defaultInfoLogInstance = "list-sysman"
-
-var (
-	infoLogFormat   = common.InfoLogFormatNone
-	infoLogInstance = defaultInfoLogInstance
-)
-
-func init() {
-	flag.Var(&infoLogFormat, "infolog-format", fmt.Sprintf(
-		"dump the info log records with their per-record metadata (%s) or as one opaque blob (%s), "+
-			"or leave them unread (%s)",
-		common.InfoLogFormatMetadata, common.InfoLogFormatRaw, common.InfoLogFormatNone))
-	// NOTE: flag.Func instead of flag.StringVar to reject an empty name
-	flag.Func("infolog-instance", fmt.Sprintf(
-		"`name` of the collection instance for the info log records (default %q)", defaultInfoLogInstance),
-		func(name string) error {
-			if name == "" {
-				return errors.New("must not be empty")
-			}
-			infoLogInstance = name
-			return nil
-		})
-}
 
 func (d *DeviceInfo) collectRasInfoExp(ras *sysman.Ras, info *RasInfo) {
 	if states, err := exp.NewRas(ras).GetStateExp(); err != nil {
@@ -51,72 +23,100 @@ func (d *DeviceInfo) collectRasInfoExp(ras *sysman.Ras, info *RasInfo) {
 	}
 }
 
+func (d *DeviceInfo) collectVFInfoExp(device *sysman.Device) {
+	vfs, err := exp.NewDevice(device).EnumEnabledVFExp()
+	if err != nil {
+		d.recordError("VirtualFunctions", err)
+		return
+	}
+
+	result := make([]VFInfo, len(vfs))
+	for i, vf := range vfs {
+		if caps, err := vf.GetCapabilitiesExp(); err != nil {
+			d.recordError("VirtualFunction.GetCapabilitiesExp2", err)
+		} else {
+			result[i].Capabilities = &caps
+		}
+		if memUtil, err := vf.GetMemoryUtilizationExp(); err != nil {
+			d.recordError("VirtualFunction.GetMemoryUtilizationExp2", err)
+		} else {
+			result[i].MemoryUtilization = memUtil
+		}
+		if engineUtil, err := vf.GetEngineUtilizationExp(); err != nil {
+			d.recordError("VirtualFunction.GetEngineUtilizationExp2", err)
+		} else {
+			result[i].EngineUtilization = engineUtil
+		}
+	}
+
+	d.VirtualFunctions = result
+}
+
 // collectInfoLogsExp lists the info logs of the driver.
-// NOTE: The log records themselves are only read when asked for with
-// -infolog-format, as reading consumes them.
+// NOTE: The log records themselves are only collected when asked for with
+// -infolog-dump, as collecting them may consume them.
 func (d *DriverInfo) collectInfoLogsExp(driver *sysman.Driver) {
 	infoLogs, err := intel.NewDriver(driver).EnumInfoLogs()
 	if err != nil {
-		d.recordError("InfoLogs", err)
+		d.recordError("IntelInfoLogs", err)
 		return
 	}
 
 	result := make([]InfoLogInfo, len(infoLogs))
 	for i, infoLog := range infoLogs {
 		if props, err := infoLog.GetProperties(); err != nil {
-			d.recordError("InfoLog.GetProperties", err)
+			d.recordError("IntelInfoLog.GetProperties", err)
 		} else {
 			result[i].Properties = &props
 		}
-		if infoLogFormat != common.InfoLogFormatNone {
-			result[i].Records = d.readInfoLogExp(infoLog, result[i].Properties)
+		if infoLogDump {
+			d.readInfoLogExp(infoLog, &result[i])
 		}
 	}
 
-	d.InfoLogs = result
+	d.IntelInfoLogs = result
 }
 
-// readInfoLogExp reads all the pending records of one info log, consuming them.
-// The default collection buffer configuration of the driver is used.
-func (d *DriverInfo) readInfoLogExp(infoLog *intel.InfoLog, props *intel.InfoLogPropertiesExp) *InfoLogRecords {
-	instance := infoLogInstance
-	if props != nil && props.IsInstancedCollectionSupported == 0 {
-		instance = ""
+// readInfoLogExp reads all the pending records of one info log.
+//
+// NOTE: the records are peeked at, i.e. left in place for the other consumers of
+// the log, whenever the log supports peeking. Otherwise, the records are read and thus consumed.
+func (d *DriverInfo) readInfoLogExp(infoLog *intel.InfoLog, info *InfoLogInfo) {
+	props := info.Properties
+	name := infoLogInstance
+	if props != nil && !props.IsNamedInstancedCollectionSupported.IsTrue() {
+		name = ""
 	}
-	if err := infoLog.Enable(instance, 0, 0); err != nil {
-		d.recordError("InfoLog.Enable", err)
-		return nil
+	instance, err := infoLog.CreateInstance(name, 0)
+	if err != nil {
+		d.recordError("IntelInfoLog.CreateInstance", err)
+		return
 	}
 	defer func() {
-		if err := infoLog.Disable(); err != nil {
-			d.recordError("InfoLog.Disable", err)
+		if err := instance.Delete(); err != nil {
+			d.recordError("IntelInfoLogInstance.Delete", err)
 		}
 	}()
 
-	// NOTE: the data read is valid (and consumed) even if the driver had to
-	// drop records, i.e. it is reported despite an error
-	if infoLogFormat == common.InfoLogFormatRaw {
-		data, err := infoLog.ReadAll()
-		if err != nil {
-			d.recordError("InfoLog.ReadAll", err)
-		}
-		if len(data) == 0 {
-			return nil
-		}
-		return &InfoLogRecords{Dump: hex.Dump(data)}
+	collect, context := instance.PeekWithMetadata, "IntelInfoLogInstance.PeekWithMetadata"
+	if props == nil || !props.IsPeekSupported.IsTrue() {
+		collect, context = instance.ReadWithMetadata, "IntelInfoLogInstance.ReadWithMetadata"
 	}
 
-	records, err := infoLog.ReadWithMetadata()
-	if err != nil {
-		d.recordError("InfoLog.ReadWithMetadata", err)
-	}
+	// NOTE: the records that were collected are valid (and consumed, unless
+	// peeked at) even if the collection failed midway. They are reported
+	// despite an error.
+	records, status, err := collect(infoLogTimeout)
+	d.recordError(context, err)
+
+	info.BufferSizeInKb = instance.BufferSizeInKb
+	info.Collection = &InfoLogCollection{Status: status}
 	if len(records) == 0 {
-		return nil
+		return
 	}
 
-	result := &InfoLogRecords{Records: make([]InfoLogRecord, len(records))}
+	info.Collection.Records = make([]InfoLogRecord, len(records))
 	for i, record := range records {
-		result.Records[i] = InfoLogRecord{Metadata: record.Metadata, Dump: hex.Dump(record.Data)}
+		info.Collection.Records[i] = InfoLogRecord{InfoLogMetadataExp: record.Metadata, Dump: hex.Dump(record.Data)}
 	}
-	return result
 }

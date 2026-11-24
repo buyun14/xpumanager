@@ -3,7 +3,12 @@
 #
 # SPDX-License-Identifier: MIT
 
-# Use '--build-arg TOOLS="strace"' to build local XPUMD image that includes specified debugging tools
+# Image variants (build target):
+# - "final" (default): production image with only the daemon and its runtime dependencies
+# - "devel": adds the Level-Zero stub driver, xpuinfo-cli, level-zero-go example apps
+#   and optional debugging TOOLS
+#
+# Use '--target devel --build-arg TOOLS="strace"' to build local XPUMD image that includes specified debugging tools
 # - works only for tools that do not need configs etc, only their libs
 # Then run image with other entrypoint than the default XPUMD one, e.g:
 # - "docker run -it --rm --cap-add SYS_PTRACE --entrypoint strace ... <image> -f /usr/local/bin/xpumd"
@@ -20,30 +25,20 @@ ARG BASE_IMAGE=scratch
 #      FILES_DIR=debs/<package-dir>
 ARG BACKEND=deb
 
-# NOTE: The base images are pinned by digest for reproducible builds (Dependabot updates them).
-
-# --- Go toolchain (self-contained, so it can be copied to the builder image) ---
-FROM golang:1.27.3-trixie@sha256:c65ecfe613b539ac74c62a4c3b2c27e8f8a6076384c8f27e8a3c0f3be17cc385 AS go
+# NOTE: The base image is pinned by digest for reproducible builds (Dependabot updates it).
 
 # --- Base build stage with necessary distro setup / packages ---
-#
-# NOTE: The final image gets its runtime libraries (libc, libstdc++, libudev...) from here,
-# match distro with what the driver stack packages are built for.
-# (buildpack-deps is Ubuntu with common build tools: compilers, make, git, curl...)
-FROM buildpack-deps:24.04@sha256:19a04a89ed67f2c52c255e17bdd6d6962b7eb3aaae4d62da6b1b8797142bca90 AS builder-base
-
-COPY --from=go /usr/local/go/ /usr/local/go/
-ENV GOPATH=/go \
-    GOTOOLCHAIN=local \
-    PATH=/go/bin:/usr/local/go/bin:$PATH
+FROM golang:1.27.3-trixie@sha256:af1bfc2614ebb1dbd31af514b78740fd678850e76498762b425ecee4c5c6ea80 AS builder-base
 
 # Enable source packages, install IGSC build dependencies and extra Sysman dependencies
 # (Sysman does not link the latter but loads them at runtime: netlink for RAS and
 # fabric metrics, tracefs for info logs)
-RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources && \
+RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources && \
     apt-get update && apt-get install -y --no-install-recommends \
     cmake \
+    jq \
     libcyaml-dev \
+    libyaml-dev \
     ninja-build \
     libudev-dev \
     pkg-config \
@@ -52,7 +47,8 @@ RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.s
 
 WORKDIR /debs/
 
-COPY scripts/copy-files-and-package-info.sh .
+COPY scripts/copy-files-and-package-info.sh scripts/download-debs.sh \
+     scripts/package-origins.sh ./
 
 
 # --- Build stage for using local driver DEBs ---
@@ -76,9 +72,9 @@ RUN dpkg -i ./*.deb  &&  ls -l /usr/lib/x86_64-linux-gnu/libig*.so.*
 FROM builder-base AS builder-deb
 
 # driver stack DEB package versions
-ARG IGC_CORE_VERSION=2.41.5+22716
-ARG COMPUTE_RUNTIME_RELEASE=26.35.39758.10
-ARG LIBIGDGMM12_VERSION=22.10.0
+ARG IGC_CORE_VERSION=2.42.6+23070
+ARG COMPUTE_RUNTIME_RELEASE=26.40.40196.8
+ARG LIBIGDGMM12_VERSION=22.10.2
 ARG LEVEL_ZERO_VERSION=1.34.0
 
 # Git repo tags & commit hashes to match against them for IGSC source build
@@ -95,13 +91,14 @@ ARG FILES_DIR=level-zero-go/level-zero
 COPY $FILES_DIR/$CHECKSUMS_LOADER $FILES_DIR/$CHECKSUMS_BACKEND ./
 
 # Download and install Level-Zero and its dependencies.
+# (libigdgmm12 is released with compute-runtime, but is built from gmmlib)
 RUN IGC_CORE_RELEASE=${IGC_CORE_VERSION%%+*} && \
-    curl -fS --fail-early \
-         -LO https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_CORE_RELEASE}/intel-igc-core-2_${IGC_CORE_VERSION}_amd64.deb \
-         -LO https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_RELEASE}/libigdgmm12_${LIBIGDGMM12_VERSION}_amd64.deb \
-         -LO https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_RELEASE}/libze-intel-gpu1_${COMPUTE_RUNTIME_RELEASE}-0_amd64.deb \
-         -LO https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/libze1_${LEVEL_ZERO_VERSION}+u24.04_amd64.deb \
-         -LO https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/libze-dev_${LEVEL_ZERO_VERSION}+u24.04_amd64.deb \
+    /debs/download-debs.sh /debs/download-origins.json \
+         https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_CORE_RELEASE}/intel-igc-core-2_${IGC_CORE_VERSION}_amd64.deb \
+         https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_RELEASE}/libigdgmm12_${LIBIGDGMM12_VERSION}_amd64.deb,purl=pkg:github/intel/gmmlib@intel-gmmlib-${LIBIGDGMM12_VERSION} \
+         https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_RELEASE}/libze-intel-gpu1_${COMPUTE_RUNTIME_RELEASE}-0_amd64.deb \
+         https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/libze1_${LEVEL_ZERO_VERSION}+u24.04_amd64.deb \
+         https://github.com/oneapi-src/level-zero/releases/download/v${LEVEL_ZERO_VERSION}/libze-dev_${LEVEL_ZERO_VERSION}+u24.04_amd64.deb \
 	 && \
     if ! sha256sum --check --strict $CHECKSUMS_LOADER $CHECKSUMS_BACKEND ; then \
         echo "--- Expected ($CHECKSUMS_LOADER / $CHECKSUMS_BACKEND): ---"; \
@@ -131,7 +128,8 @@ RUN mkdir /src && \
     ldconfig
 
 # libigsc and libmetee are source-built (not DEB packages):
-# copy manually to output dir and add synthetic dpkg status entries for scanners
+# copy manually to output dir, add synthetic dpkg status entries for scanners
+# and record their origin for the SBOM
 RUN install -D /usr/lib/x86_64-linux-gnu/libigsc.so.1 \
                /out/usr/lib/x86_64-linux-gnu/libigsc.so.1 && \
     install -d /out/var/lib/dpkg/ && \
@@ -149,7 +147,13 @@ Architecture: amd64\n\
 Version: ${METEE_VERSION}\n\
 Homepage: https://github.com/intel/metee\n\
 Description: Intel(R) ME TEE Library (statically linked to libigsc)\n\
-" >> /out/var/lib/dpkg/status
+" >> /out/var/lib/dpkg/status && \
+    /debs/package-origins.sh add /out/usr/share/doc/xpumd/package-origins.spdx.json \
+        libigsc1 \
+        pkg:github/intel/igsc@${IGSC_VERSION} git+https://github.com/intel/igsc.git@${IGSC_COMMIT} && \
+    /debs/package-origins.sh add /out/usr/share/doc/xpumd/package-origins.spdx.json \
+        libmetee0 \
+        pkg:github/intel/metee@${METEE_VERSION} git+https://github.com/intel/metee.git@${METEE_COMMIT}
 
 
 # --- Alias for source build builder stage ---
@@ -198,21 +202,7 @@ RUN /debs/copy-files-and-package-info.sh /out \
             /lib/x86_64-linux-gnu/libmetee.so.*.*.* \
         ; fi)
 
-# Install debug tool binary & its libs to where they get copied to final image
-ARG TOOLS
-RUN if [ -n "$TOOLS" ]; then \
-      apt-get update && \
-      apt-get install -y --no-install-recommends $TOOLS && \
-      /debs/copy-files-and-package-info.sh /out \
-      $(for pkg in $TOOLS; do \
-        for bin in $(dpkg -L $pkg | grep bin/); do \
-          echo $bin; \
-          ldd $bin | awk '/=>/{lib=$3; if(lib=="not") lib="missing:"$1; print lib}'; \
-        done \
-      done); \
-    fi
-
-# Build xpumd / xpuinfo-cli + stub driver & install them
+# Build xpumd + xpuinfo-cli & install them (xpuinfo-cli only to the devel image)
 # Use '--build-arg BUILD_TARGET=build-cover' to get coverage-instrumented binaries
 ARG BUILD_TARGET=build
 ARG XPUMD_VERSION=latest
@@ -221,18 +211,26 @@ RUN --mount=type=cache,target=/go/pkg/mod/ \
     --mount=src=.,target=.,rw \
     mkdir -p /out && \
     make "$BUILD_TARGET" && \
-    make -C level-zero-go/level-zero-stub clean test && \
     install -D dist/xpumd /out/usr/local/bin/xpumd && \
-    install -D dist/xpuinfo-cli /out/usr/local/bin/xpuinfo-cli && \
+    install -D dist/xpuinfo-cli /out-devel/usr/local/bin/xpuinfo-cli && \
     install -D config-example.yaml /out/etc/xpumd/config-example.yaml && \
-    install -D level-zero-go/level-zero-stub/libze_stub.so \
-               /out/usr/local/lib/xpumd/level-zero-stub/libze_loader.so.1 && \
-    install -D level-zero-go/level-zero-stub/example-config.yaml \
-               /out/etc/xpumd/level-zero-stub/example-config.yaml && \
     go -C dist tool -modfile $(pwd)/tools/go.mod \
         go-licenses save . \
                 --ignore github.com/intel/xpumanager/xpumd \
                 --save_path /out/usr/share/doc/xpumd/licenses
+
+# Build the stable Sysman Go bindings examples & install them to the devel image
+# (for checking what Sysman reports on given HW, e.g. for the stub driver configs)
+RUN --mount=type=cache,target=/go/pkg/mod/ \
+    --mount=type=cache,target=/root/.cache/go-build \
+    --mount=src=level-zero-go,target=/src/level-zero-go,ro \
+    --mount=src=tools,target=/src/tools,ro \
+    EXAMPLES=/src/level-zero-go/examples && \
+    make -C $EXAMPLES build-list-sysman build-events-sysman BIN_DIR=/out-devel/usr/local/bin && \
+    go -C $EXAMPLES tool -modfile /src/tools/go.mod \
+        go-licenses save ./list-sysman ./events-sysman \
+                --ignore github.com/intel/level-zero-go/examples \
+                --save_path /out-devel/usr/share/doc/level-zero-go-examples/licenses
 
 # Endpoints cannot be limited to localhost in a container,
 # as then accessing them would require using host networking
@@ -242,7 +240,9 @@ RUN sed -i 's/127.0.0.1:/0.0.0.0:/' /out/etc/xpumd/config-example.yaml
 # --- Backend from the released DEB package (BACKEND=deb) ---
 FROM builder AS backend-deb
 
-RUN /debs/copy-files-and-package-info.sh /backend \
+# Package origins go outside of /backend/usr/, see the "out" stage
+RUN ORIGINS=/backend/package-origins.spdx.json \
+    /debs/copy-files-and-package-info.sh /backend \
         /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1
 
 
@@ -260,11 +260,11 @@ FROM backend-deb AS backend-local
 # scripts/sync-dockerfile-args.sh.
 FROM builder-base AS backend-src
 
-# Compute-runtime commit date 2026-08-25
-ARG COMPUTE_RUNTIME_COMMIT=9c2abbc844661895dc8c45ad84cdc50eb19e146c
-ARG LIBIGDGMM12_VERSION=22.10.0
-ARG LIBIGDGMM12_COMMIT=0246660b2ade17afc1c9c4c510368fa649ca809f
-ARG LEVEL_ZERO_VERSION=1.32.0
+# Compute-runtime commit date 2026-10-21
+ARG COMPUTE_RUNTIME_COMMIT=9b578ced3e1e40905d312e5e9b7bb4dd6d45f46e
+ARG LIBIGDGMM12_VERSION=22.10.2
+ARG LIBIGDGMM12_COMMIT=733c91a19baa65c40f4b1cf95a3991cc8c84d866
+ARG LEVEL_ZERO_VERSION=1.34.0
 
 # The Graphics Compiler is NOT taken from the manifest to avoid compiling it from sources, too.
 ARG IGC_CORE_VERSION=2.40.13+22418
@@ -325,7 +325,7 @@ RUN SRC=/src/gmmlib && BUILD=$SRC/build && \
     git -C $SRC checkout ${LIBIGDGMM12_COMMIT} && \
     cmake -G Ninja -Wno-dev -LH -S $SRC -B $BUILD \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_INSTALL_PREFIX=/usr/local && \
+          -DCMAKE_INSTALL_PREFIX=/usr && \
     ninja -C $BUILD && \
     ninja -C $BUILD install && \
     ldconfig
@@ -368,7 +368,10 @@ Version: ${VERSION}+git.${COMPUTE_RUNTIME_COMMIT}\n\
 Homepage: https://github.com/intel/compute-runtime\n\
 Description: Intel(R) Graphics Compute Runtime for oneAPI Level Zero\n\
  Built from the pinned compute-runtime revision, not from the released package.\n\
-" > /backend/var/lib/dpkg/status
+" > /backend/var/lib/dpkg/status && \
+    /debs/package-origins.sh add /backend/package-origins.spdx.json libze-intel-gpu1 \
+        pkg:github/intel/compute-runtime@${COMPUTE_RUNTIME_COMMIT} \
+        git+https://github.com/intel/compute-runtime.git@${COMPUTE_RUNTIME_COMMIT}
 
 
 # --- The backend selected with BACKEND ---
@@ -379,14 +382,45 @@ FROM backend-${BACKEND} AS backend
 FROM builder AS out
 
 # Only the files of the backend: its dpkg status entry is appended to the database
-# of the builder instead of replacing it
+# of the builder instead of replacing it, and its package origins (kept outside of
+# /backend/usr/ so they don't overwrite the builder ones) are merged
 COPY --from=backend /backend/usr/ /out/usr/
-COPY --from=backend /backend/var/lib/dpkg/status /backend-package-info
-RUN cat /backend-package-info >> /out/var/lib/dpkg/status
+COPY --from=backend /backend/var/lib/dpkg/status /backend/package-origins.spdx.json \
+     /backend-package-info/
+RUN cat /backend-package-info/status >> /out/var/lib/dpkg/status && \
+    /debs/package-origins.sh merge /out/usr/share/doc/xpumd/package-origins.spdx.json \
+        /backend-package-info/package-origins.spdx.json
+
+# Build the stub driver & install it to the devel image
+# (only level-zero-go is mounted, so other changes don't invalidate this step)
+RUN --mount=src=level-zero-go,target=/src/level-zero-go,rw \
+    STUB=/src/level-zero-go/level-zero-stub && \
+    make -C $STUB clean test && \
+    install -D $STUB/libze_stub.so \
+               /out-devel/usr/local/lib/xpumd/level-zero-stub/libze_loader.so.1 && \
+    install -D $STUB/example-config.yaml \
+               /out-devel/etc/xpumd/level-zero-stub/example-config.yaml
+
+# Install debug tool binary & its libs to where they get copied to devel image.
+ARG TOOLS
+RUN if [ -n "$TOOLS" ]; then \
+      apt-get update && \
+      apt-get install -y --no-install-recommends $TOOLS && \
+      install -D /out/var/lib/dpkg/status /out-devel/var/lib/dpkg/status && \
+      install -D /out/usr/share/doc/xpumd/package-origins.spdx.json \
+                 /out-devel/usr/share/doc/xpumd/package-origins.spdx.json && \
+      /debs/copy-files-and-package-info.sh /out-devel \
+      $(for pkg in $TOOLS; do \
+        for bin in $(dpkg -L $pkg | grep bin/); do \
+          echo $bin; \
+          ldd $bin | awk '/=>/{lib=$3; if(lib=="not") lib="missing:"$1; print lib}'; \
+        done \
+      done); \
+    fi
 
 
-# --- The final image ---
-FROM ${BASE_IMAGE} AS final
+# --- The production image ---
+FROM ${BASE_IMAGE} AS production
 
 COPY --from=out /out/ /
 
@@ -396,3 +430,13 @@ USER 65534:65534
 ENV XDG_RUNTIME_DIR=/run/xpumd
 
 ENTRYPOINT ["/usr/local/bin/xpumd"]
+
+
+# --- The devel image: production + stub driver, xpuinfo-cli, level-zero-go examples & debug TOOLS ---
+FROM production AS devel
+
+COPY --from=out /out-devel/ /
+
+
+# --- The default build target ---
+FROM production AS final

@@ -9,9 +9,12 @@
 #include "debug.h"
 #include "table_builder.h"
 #include <assert.h>
+#include <algorithm>
+#include <charconv>
+#include <optional>
 #include <CLI/CLI.hpp>
 #include <temperature.h>
-#include <memory.h>
+#include <memory>
 #include <sstream>
 #include <iomanip>
 #include <thread>
@@ -68,15 +71,86 @@ healthSubCmdStruct componentCmds[] = {
 	{healthSubCmdType::HEALTH_CORETEMPERATURE, &cmdHealth::coreTemperature, false},
 	{healthSubCmdType::HEALTH_MEMORYTEMPERATURE, &cmdHealth::memoryTemperature, false},
 	{healthSubCmdType::HEALTH_POWER, &cmdHealth::gpuPower, false},
-	{healthSubCmdType::HEALTH_MEMORY, &cmdHealth::healthMemory, false},
-	{healthSubCmdType::HEALTH_UNSUPPORTED0, &cmdHealth::unsupported, false},
 	{healthSubCmdType::HEALTH_FREQUENCY, &cmdHealth::frequency, true},
 };
 
 /**
- * @brief Adds help commands to the provided help list.
+ * @brief Parses a -c value into a component ID listed in componentCmds
  *
- * @param helpList A pointer to a list of help commands.
+ * Accepts only a whole decimal number that names a known component, so "abc",
+ * "4x" and unlisted IDs such as 5 and 6 are all rejected instead of throwing
+ * (std::stoi) or matching a prefix.
+ *
+ * @param [in] value The text given to -c
+ * @return The component ID, or std::nullopt if it is not a known component
+ */
+static std::optional<int> knownComponentId(const std::string &value)
+{
+	int id = 0;
+	const char *first = value.data();
+	const char *last = first + value.size();
+	const auto [ptr, ec] = std::from_chars(first, last, id);
+	if (ec != std::errc{} || ptr != last) {
+		return std::nullopt;
+	}
+	const bool known = std::ranges::any_of(componentCmds, [id](const auto &test) { return test.type == id; });
+	return known ? std::optional<int>{id} : std::nullopt;
+}
+
+/// Option table filled by addHealthOptions(): one entry per health option.
+using healthOptions = std::unordered_map<healthCmdType, healthCmdStruct>;
+
+/**
+ * @brief Declares the health options on @p sub, binding each to its entry in @p opts
+ *
+ * run() and driverMode() both parse through this so they accept the same command line.
+ *
+ * @param [in,out] sub  The CLI11 app to add the options to
+ * @param [in,out] opts The option table the parsed values are written to
+ */
+static void addHealthOptions(CLI::App &sub, healthOptions &opts)
+{
+	sub.set_help_flag("-h,--help", "Print this help message and exit");
+	sub.add_flag("-j,--json", opts[healthCmdType::HEALTH_JSON].enabled, "Print result in JSON format");
+	sub.add_flag("-l,--list", opts[healthCmdType::HEALTH_LIST].enabled, "List all available components");
+	sub.add_option("-d,--device,--id", opts[healthCmdType::HEALTH_DEVICE].val,
+				   "Device index or BDF address, comma-separated for multiple (e.g. 0,1)")
+		->each([&opts](const std::string &) { opts[healthCmdType::HEALTH_DEVICE].enabled = true; });
+	sub.add_option("-c,--component", opts[healthCmdType::HEALTH_COMPONENT].val, "Component type ID")
+		->each([&opts](const std::string &) { opts[healthCmdType::HEALTH_COMPONENT].enabled = true; });
+}
+
+/**
+ * @brief Checks the parsed options for errors that run() reports before opening a device
+ *
+ * run() prints the returned message; driverMode() skips driver initialization when
+ * there is one, so the error is reported even where Level Zero cannot initialize.
+ *
+ * @param [in] opts The parsed option table
+ * @return The error message, or std::nullopt if the options can reach a device
+ */
+static std::optional<std::string> argumentError(const healthOptions &opts)
+{
+	if (!opts.at(healthCmdType::HEALTH_LIST).enabled && !opts.at(healthCmdType::HEALTH_DEVICE).enabled) {
+		return "Wrong argument or unknown operation, run with --help for more information.";
+	}
+	const auto &componentOpt = opts.at(healthCmdType::HEALTH_COMPONENT);
+	if (componentOpt.enabled && !knownComponentId(componentOpt.val)) {
+		std::string err =
+			"Invalid component ID '" + componentOpt.val + "', run with --help for the list of component IDs.";
+		// Earlier releases used 6 for GPU Frequency; point scripts still using it at the new ID.
+		if (componentOpt.val == "6") {
+			err += " GPU Frequency was component ID 6 in earlier releases; use 4 instead.";
+		}
+		return err;
+	}
+	return std::nullopt;
+}
+
+/**
+ * @brief Prints the health usage, options and the list of valid component IDs (1-4).
+ *
+ * @param [in] helpType Which part of the help to print (for example FULL_HELP).
  */
 void cmdHealth::help(HELP helpType)
 {
@@ -105,9 +179,7 @@ void cmdHealth::help(HELP helpType)
 	helpList.push_back(helpCmd(SUB_HEADING2, "1. GPU Core Temperature"));
 	helpList.push_back(helpCmd(SUB_HEADING2, "2. GPU Memory Temperature"));
 	helpList.push_back(helpCmd(SUB_HEADING2, "3. GPU Power"));
-	helpList.push_back(helpCmd(SUB_HEADING2, "4. GPU Memory"));
-	helpList.push_back(helpCmd(SUB_HEADING2, "5. Reserved"));
-	helpList.push_back(helpCmd(SUB_HEADING2, "6. GPU Frequency"));
+	helpList.push_back(helpCmd(SUB_HEADING2, "4. GPU Frequency"));
 
 	printHelp(helpList, helpType);
 	helpList.clear();
@@ -149,7 +221,7 @@ void HealthTextPrinter::printDeviceInfo(nlohmann::ordered_json *jsonObj)
 			} else if (subitem.value().is_number_integer() && subitem.value().get<int64_t>() == -1) {
 				value = "N/A";
 			} else {
-				value = subitem.value().dump();
+				value = jsonText(subitem.value());
 			}
 			table.addRow(subitem.key(), value);
 		}
@@ -185,7 +257,7 @@ void HealthTextPrinter::print(nlohmann::ordered_json *jsonObj)
  *
  * This function iterates through all discovered devices and runs comprehensive
  * health checks on each one. For every device, it executes all available component
- * tests including temperature monitoring, power assessment, memory health evaluation
+ * tests including temperature monitoring, power assessment
  * and frequency subsystem checks. Results are stored in the provided JSON object.
  *
  * @param devList Pointer to vector of device information structures
@@ -217,11 +289,36 @@ ze_result_t cmdHealth::allComponentsAllDevices(std::vector<devInfo> *devList, nl
 }
 
 /**
+ * @brief Starts reading the power threshold of every device, when the power check will run
+ *
+ * gpuPower() then waits for the read of its device instead of starting one. See
+ * power::preloadThrottlePower().
+ *
+ * @param devList Pointer to vector of device information structures
+ */
+void cmdHealth::preloadPowerThresholds(std::vector<devInfo> *devList)
+{
+	TRACING();
+
+	// Only worth it when the power check will run
+	if (healthCmds[healthCmdType::HEALTH_COMPONENT].enabled &&
+		healthCmds[healthCmdType::HEALTH_COMPONENT].val != std::to_string(healthSubCmdType::HEALTH_POWER)) {
+		return;
+	}
+
+	for (auto &d : *devList) {
+		if (power *pwr = d.dev->getPower()) {
+			pwr->preloadThrottlePower();
+		}
+	}
+}
+
+/**
  * @brief Performs health checks on all components for a single device
  *
  * This function iterates through all available component health tests and
  * executes them for the specified device. It provides a comprehensive health
- * assessment covering core temperature, memory temperature, power, memory health
+ * assessment covering core temperature, memory temperature, power
  * and frequency subsystems. Results are stored in the provided JSON object.
  *
  * @param d Pointer to device information structure containing device handles and properties
@@ -251,7 +348,7 @@ ze_result_t cmdHealth::allComponents(devInfo *d, nlohmann::ordered_json *jsonObj
  * @brief Performs comprehensive component health assessment for the device
  *
  * This function executes a series of health checks across various device
- * components including temperatures, power consumption, memory health,
+ * components including temperatures, power consumption, frequency,
  * and overall system status. It provides a holistic view of device health.
  * Results are stored in the provided JSON object.
  *
@@ -264,9 +361,10 @@ ze_result_t cmdHealth::component(devInfo *d, nlohmann::ordered_json *jsonObj)
 	TRACING();
 	ze_result_t result = ZE_RESULT_SUCCESS;
 	bool found = false;
+	const auto componentId = knownComponentId(healthCmds[healthCmdType::HEALTH_COMPONENT].val);
 
 	for (const auto &test : componentCmds) {
-		if (test.type == stoi(healthCmds[healthCmdType::HEALTH_COMPONENT].val)) {
+		if (componentId && test.type == *componentId) {
 			// If the device is an iGPU and the test is not supported for iGPUs, skip it
 			if (d->dev->isIGPU() && !test.canRunOnIGPU) {
 				DBG("Skipping test {} for integrated GPU (BDF: {})\n", test.type, d->dev->getBDFStr());
@@ -303,7 +401,10 @@ ze_result_t cmdHealth::component(devInfo *d, nlohmann::ordered_json *jsonObj)
  * @param getTempFunc Function pointer to retrieve temperature value
  * @param thresholdErrorMsg Error message for threshold retrieval failure
  * @param tempErrorMsg Error message for temperature retrieval failure
- * @return ze_result_t ZE_RESULT_SUCCESS on success, error code otherwise
+ * @return ze_result_t ZE_RESULT_SUCCESS once the result is recorded, also when the temperature cannot be
+ *         read; an error code when there is no temperature object or the thresholds cannot be read
+ * @note A device without the sensor is reported as an error with @p tempErrorMsg. A sensor that
+ *       exists but cannot be read leaves the status unknown and is logged only at debug level.
  */
 ze_result_t cmdHealth::getTemperatureHealth(devInfo *d, nlohmann::ordered_json *jsonObj, const std::string &jsonKey,
 											ze_result_t (temperature::*getThresholdFunc)(zes_device_handle_t,
@@ -334,7 +435,10 @@ ze_result_t cmdHealth::getTemperatureHealth(devInfo *d, nlohmann::ordered_json *
 	double tempVal = 0;
 	std::string description = "Health cannot be determined for temperature sensors.";
 	result = (t->*getTempFunc)(&tempVal);
-	if (result != ZE_RESULT_SUCCESS) {
+	if (result != ZE_RESULT_SUCCESS && result != ZE_RESULT_ERROR_UNSUPPORTED_FEATURE) {
+		// The sensor exists but could not be read, as happens without root: health stays undetermined.
+		DBG("{}: 0x{:X} ({})\n", tempErrorMsg.c_str(), result, l0_error_to_string(result));
+	} else if (result != ZE_RESULT_SUCCESS) {
 		ERR("{}: 0x{:X} ({})\n", tempErrorMsg.c_str(), result, l0_error_to_string(result));
 		description = tempErrorMsg + ": " + l0_error_to_string(result);
 	}
@@ -455,6 +559,7 @@ ze_result_t cmdHealth::gpuPower(devInfo *d, nlohmann::ordered_json *jsonObj)
 	if (powerDomainCount > 0 && powerHandles != nullptr) {
 		uint64_t currentDeviceMaxDomainValue = 0;
 		uint64_t currentSubDeviceValueSum = 0;
+		bool sampled = false;
 		for (uint32_t i = 0; i < powerDomainCount; ++i) {
 			zes_power_properties_t props = {};
 			zes_power_ext_properties_t extProps = {};
@@ -471,6 +576,7 @@ ze_result_t cmdHealth::gpuPower(devInfo *d, nlohmann::ordered_json *jsonObj)
 				res = pwr->getEnergyCounter(powerHandles[i], &snap2);
 				if (res == ZE_RESULT_SUCCESS && snap2.timestamp != snap1.timestamp) {
 					uint64_t value = (snap2.energy - snap1.energy) / (snap2.timestamp - snap1.timestamp);
+					sampled = true;
 					if (props.onSubdevice) {
 						currentSubDeviceValueSum += value;
 					} else if (value > currentDeviceMaxDomainValue) {
@@ -481,45 +587,24 @@ ze_result_t cmdHealth::gpuPower(devInfo *d, nlohmann::ordered_json *jsonObj)
 		}
 		DBG("health: current device max domain power value: {}", currentDeviceMaxDomainValue);
 		DBG("health: current sum of sub-device power values: {}", currentSubDeviceValueSum);
-		auto powerVal = std::max(currentDeviceMaxDomainValue, currentSubDeviceValueSum);
-		if (powerVal < powerThreshold && status < xpumHealthStatus::XPUM_HEALTH_STATUS_OK) {
-			status = xpumHealthStatus::XPUM_HEALTH_STATUS_OK;
-			description = "Values for all the power domains are healthy.";
-		}
-		if (powerVal >= powerThreshold && status < xpumHealthStatus::XPUM_HEALTH_STATUS_WARNING) {
-			status = xpumHealthStatus::XPUM_HEALTH_STATUS_WARNING;
-			description = "Unhealthy power domain value, " + std::to_string(powerVal) +
-						  " >= " + std::to_string(powerThreshold) + " (threshold)";
+		if (sampled) {
+			auto powerVal = std::max(currentDeviceMaxDomainValue, currentSubDeviceValueSum);
+			if (powerVal < powerThreshold) {
+				status = xpumHealthStatus::XPUM_HEALTH_STATUS_OK;
+				description = "Values for all the power domains are healthy.";
+			} else {
+				status = xpumHealthStatus::XPUM_HEALTH_STATUS_WARNING;
+				description = "Unhealthy power domain value, " + std::to_string(powerVal) +
+							  " >= " + std::to_string(powerThreshold) + " (threshold)";
+			}
+		} else {
+			ERR("No power domain could be sampled\n");
 		}
 	}
 
 	(*jsonObj)["power_health"] = {{"status", getHealthStatusString(status)}, {"description", description}};
 
 	return ZE_RESULT_SUCCESS;
-}
-
-/**
- * @brief Converts memory health enum to human-readable string
- *
- * This function converts ZES memory health enumeration values to descriptive
- * string representations for display purposes.
- *
- * @param health The ZES memory health enumeration value
- * @return std::string Human-readable health status string
- */
-xpumHealthStatus cmdHealth::getHealthStatus(zes_mem_health_t health)
-{
-	if (health == ZES_MEM_HEALTH_OK) {
-		return xpumHealthStatus::XPUM_HEALTH_STATUS_OK;
-	} else if (health == ZES_MEM_HEALTH_DEGRADED) {
-		return xpumHealthStatus::XPUM_HEALTH_STATUS_WARNING;
-	} else if (health == ZES_MEM_HEALTH_CRITICAL) {
-		return xpumHealthStatus::XPUM_HEALTH_STATUS_CRITICAL;
-	} else if (health == ZES_MEM_HEALTH_REPLACE) {
-		return xpumHealthStatus::XPUM_HEALTH_STATUS_CRITICAL;
-	} else {
-		return xpumHealthStatus::XPUM_HEALTH_STATUS_UNKNOWN;
-	}
 }
 
 /**
@@ -548,98 +633,6 @@ std::string cmdHealth::getHealthStatusString(xpumHealthStatus status)
 	default:
 		return "Unknown";
 	}
-}
-
-/**
- * @brief Converts ZES memory health enum to descriptive text
- *
- * This function maps Level Zero Sysman (ZES) memory health enumeration values
- * to detailed descriptive text strings that explain the specific memory health
- * condition. These descriptions provide users with actionable information about
- * memory subsystem status and recommended actions.
- * link: https://oneapi-src.github.io/level-zero-spec/level-zero/latest/sysman/PROG.html#querying-memory-modules
- *
- * @param val The ZES memory health enumeration value to describe
- * @return std::string Detailed description of the memory health condition
- */
-std::string cmdHealth::getHealthStatusDescription(zes_mem_health_t val)
-{
-	switch (val) {
-	case zes_mem_health_t::ZES_MEM_HEALTH_UNKNOWN:
-		return std::string("The memory health cannot be determined.");
-	case zes_mem_health_t::ZES_MEM_HEALTH_OK:
-		return std::string("All memory channels are healthy.");
-	case zes_mem_health_t::ZES_MEM_HEALTH_DEGRADED:
-		return std::string(
-			"Excessive correctable errors have been detected on one or more channels. Device should be reset.");
-	case zes_mem_health_t::ZES_MEM_HEALTH_CRITICAL:
-		return std::string("Operating with reduced memory to cover banks with too many uncorrectable errors.");
-	case zes_mem_health_t::ZES_MEM_HEALTH_REPLACE:
-		return std::string("Device should be replaced due to excessive uncorrectable errors.");
-	default:
-		return std::string("The memory health cannot be determined.");
-	}
-}
-/**
- * @brief Retrieves GPU memory health status
- *
- * This function queries the device's memory subsystem to determine the current
- * health status of GPU memory components. It evaluates memory integrity,
- * error rates, and overall memory subsystem health, providing critical
- * information for system reliability assessment. Results are stored in the provided
- * JSON object under the "memory_health" key.
- *
- * @param d Pointer to device information structure containing device handles
- * @param jsonObj Pointer to a JSON object where results will be stored
- * @return ze_result_t ZE_RESULT_SUCCESS on successful health check, error code otherwise
- */
-ze_result_t cmdHealth::healthMemory(devInfo *d, nlohmann::ordered_json *jsonObj)
-{
-	TRACING();
-	ze_result_t result = ZE_RESULT_SUCCESS;
-	zes_mem_health_t health;
-
-	memory *mem = d->dev->getMemory();
-	if (mem == nullptr) {
-		ERR("Failed to get memory handle\n");
-		setHealthFailureJson(jsonObj, "memory_health", "Failed to get memory handle.");
-		return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
-	}
-
-	result = mem->getMemoryHealth(&health);
-	if (result != ZE_RESULT_SUCCESS) {
-		ERR("Failed to get memory health: 0x{:X} ({})\n", result, l0_error_to_string(result));
-		setHealthFailureJson(jsonObj, "memory_health",
-							 std::string("Failed to get memory health: ") + l0_error_to_string(result));
-		return result;
-	}
-
-	xpumHealthStatus healthStatus = this->getHealthStatus(health);
-
-	(*jsonObj)["memory_health"] = {{"status", getHealthStatusString(healthStatus)},
-								   {"description", getHealthStatusDescription(health)}};
-
-	return ZE_RESULT_SUCCESS;
-}
-
-/**
- * @brief Performs unsupported feature health assessment
- *
- * This function evaluates the health status of unsupported item.
- *
- * @param d Pointer to device information structure (currently unused)
- * @param jsonObj Pointer to a JSON object where results will be stored
- * @return ze_result_t ZE_RESULT_SUCCESS indicating successful assessment
- */
-ze_result_t cmdHealth::unsupported(UNUSED devInfo *d, nlohmann::ordered_json *jsonObj)
-{
-	TRACING();
-	std::string description = "Unsupported.";
-	xpumHealthStatus status = xpumHealthStatus::XPUM_HEALTH_STATUS_UNKNOWN;
-
-	(*jsonObj)["unsupported_item_health"] = {{"status", getHealthStatusString(status)}, {"description", description}};
-
-	return ZE_RESULT_SUCCESS;
 }
 
 /**
@@ -779,22 +772,50 @@ ze_result_t cmdHealth::frequency(UNUSED devInfo *d, nlohmann::ordered_json *json
 }
 
 /**
- * @brief A bare `health` only prints help; every other form queries devices.
+ * @brief Only a command line that run() can take to a device needs the driver.
+ *
+ * A bare `health`, a parse error and the argument errors from argumentError()
+ * are all reported by run() before any device is opened, so they must not fail
+ * first on driver initialization.
  *
  * @param[in] cmdArgs  argv tokens after the subcommand name.
  *
- * @retval DriverMode::None  @p cmdArgs is empty.
+ * @retval DriverMode::None  @p cmdArgs is empty, fails to parse, or is rejected by argumentError().
  * @retval DriverMode::Full  Otherwise.
  */
 DriverMode cmdHealth::driverMode(std::span<char *const> cmdArgs) const
 {
-	return printsHelpOnly(cmdArgs) ? DriverMode::None : DriverMode::Full;
+	if (printsHelpOnly(cmdArgs)) {
+		return DriverMode::None;
+	}
+	healthOptions opts = {{healthCmdType::HEALTH_JSON, {}},
+						  {healthCmdType::HEALTH_LIST, {}},
+						  {healthCmdType::HEALTH_DEVICE, {}},
+						  {healthCmdType::HEALTH_COMPONENT, {}}};
+	CLI::App sub{"Check GPU component health", "health"};
+	addHealthOptions(sub, opts);
+	// CLI11 takes a token vector in reverse order.
+	std::vector<std::string> tokens(cmdArgs.rbegin(), cmdArgs.rend());
+	try {
+		sub.parse(std::move(tokens));
+	} catch (const CLI::Error &) {
+		return DriverMode::None;
+	}
+	return argumentError(opts) ? DriverMode::None : DriverMode::Full;
 }
 
 /**
- * @brief Executes the health run.
+ * @brief Executes the health command.
  *
- * @return int Returns 0 on success.
+ * Parses the options with addHealthOptions(), reports argumentError() failures
+ * (missing -d/-l, unknown component ID) before any device is opened, then prints
+ * health for the selected devices and component.
+ *
+ * @param [in,out] args Parsed program arguments and the Sysman driver instance.
+ *
+ * @retval ZE_RESULT_SUCCESS                Health was printed, or help was requested.
+ * @retval ZE_RESULT_ERROR_INVALID_ARGUMENT Bad command line or unknown component ID.
+ * @retval other                            Device lookup or health query failed.
  */
 int cmdHealth::run(arg_struct *args)
 {
@@ -810,14 +831,7 @@ int cmdHealth::run(arg_struct *args)
 	}
 
 	CLI::App sub{"Check GPU component health", "health"};
-	sub.set_help_flag("-h,--help", "Print this help message and exit");
-	sub.add_flag("-j,--json", healthCmds[healthCmdType::HEALTH_JSON].enabled, "Print result in JSON format");
-	sub.add_flag("-l,--list", healthCmds[healthCmdType::HEALTH_LIST].enabled, "List all available components");
-	sub.add_option("-d,--device,--id", healthCmds[healthCmdType::HEALTH_DEVICE].val,
-				   "Device index or BDF address, comma-separated for multiple (e.g. 0,1)")
-		->each([&](const std::string &) { healthCmds[healthCmdType::HEALTH_DEVICE].enabled = true; });
-	sub.add_option("-c,--component", healthCmds[healthCmdType::HEALTH_COMPONENT].val, "Component type ID")
-		->each([&](const std::string &) { healthCmds[healthCmdType::HEALTH_COMPONENT].enabled = true; });
+	addHealthOptions(sub, healthCmds);
 
 	try {
 		sub.parse(args->argc - 1, args->argv + 1);
@@ -842,12 +856,12 @@ int cmdHealth::run(arg_struct *args)
 		printer = std::make_unique<HealthTextPrinter>();
 	}
 	auto jsonObj = std::make_unique<nlohmann::ordered_json>();
-	// user must specify a device ID or PCI BDF address
-	if (!healthCmds[healthCmdType::HEALTH_LIST].enabled && !healthCmds[healthCmdType::HEALTH_DEVICE].enabled) {
+	// A missing -d/-l or an unknown component ID is rejected before any device is
+	// opened; driverMode() skips driver init for these, so this runs without Level Zero.
+	if (const auto err = argumentError(healthCmds)) {
 		result = ZE_RESULT_ERROR_INVALID_ARGUMENT;
-		std::string err = "Wrong argument or unknown operation, run with --help for more information.";
-		DBG("Error: {}\n", err.c_str());
-		(*jsonObj)["error"] = err;
+		DBG("Error: {}\n", err->c_str());
+		(*jsonObj)["error"] = *err;
 		(*jsonObj)["errno"] = result;
 		printer->print(jsonObj.get());
 		return result;
@@ -863,6 +877,8 @@ int cmdHealth::run(arg_struct *args)
 		printer->print(jsonObj.get());
 		return result;
 	}
+
+	preloadPowerThresholds(&deviceList);
 
 	if (healthCmds[healthCmdType::HEALTH_LIST].enabled) {
 		// List all devices

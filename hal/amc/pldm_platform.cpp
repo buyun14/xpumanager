@@ -85,49 +85,26 @@ uint8_t pldm::pfMonCtrlCmd(uint8_t cmd, uint8_t size)
 	TRACING();
 
 	uint8_t ret = PLDM_SUCCESS;
-	uint8_t *wptr = (uint8_t *)mI2cPldmWrite;
-
-	// Exclude first 3 bytes of MCTP header while calculating byte count
-	// sizeof(destSlaveAddr) + sizeof(cmdCode) + sizeof(byteCount) = 3 bytes
-	uint8_t byteCount = size - 3;
-	ret = commandConstruction(&mI2cPldmWrite->mctpSmbusHdr, MCTP_SOM, MCTP_EOM, MCTP_PAK_SEQ, byteCount,
-							  MCTP_INTEGRITY_CHECK);
-	if (ret != PLDM_SUCCESS) {
-		ERR("PFMonCtrl : MCTP command construction failed\n");
+	if (size < PLDM_REQUEST_FRAME_HDR_SIZE) {
+		ERR("PFMonCtrl : Invalid request size {} for command 0x{:02x}\n", size, cmd);
 		return PLDM_ERROR;
 	}
-	mI2cPldmWrite->mctpSmbusHdr.msgType = PLDM_OVER_MCTP;
+
 	bool infLoop = (cmd == PLDM_GET_PDR) ? true : false;
 	do {
-		if (instanceID == PLDM_INSTANCE_ID_MAX) {
-			instanceID = 1;
-		}
-		ret = pldmHdrConstruction(&mI2cPldmWrite->pldmHdr, instanceID, PLDM_PLATFORM_MONITORING, cmd,
-								  PLDM_ASYNC_REQUEST_NOTIFY, PLDM_REQUEST);
-		if (ret != PLDM_SUCCESS) {
-			ERR("PFMonCtrl : PLDM header construction failed\n");
-			return PLDM_ERROR;
-		}
 		ret = pfFillPayload(cmd, size);
 		if (ret != PLDM_SUCCESS) {
 			ERR("PFMonCtrl : Payload fill failed\n");
 			return PLDM_ERROR;
 		}
-		if (i2cobj->writeAmc(wptr + 1, size) != true) {
-			ERR("PFMonCtrl : I2C Write failure\n");
+		uint8_t id = 0;
+		if (pldmRequest(PLDM_PLATFORM_MONITORING, cmd, size - PLDM_REQUEST_FRAME_HDR_SIZE, id) != PLDM_SUCCESS) {
+			ERR("PFMonCtrl : No response to command 0x{:02x}\n", cmd);
 			return PLDM_ERROR;
 		}
-		DBG("PFMonCtrl TX  :: ");
-		hexdump(wptr, size);
-		MSLEEP(I2C_EVENT_WAIT_PERIOD_MS);
-		if (receivePldmMessage() != PLDM_SUCCESS) {
-			ERR("PFMonCtrl : I2C read/assemble failure\n");
+		if (processPlatformResponse(cmd, id) != PLDM_SUCCESS) {
 			return PLDM_ERROR;
 		}
-		if (processPlatformResponse(cmd, instanceID) != PLDM_SUCCESS) {
-			return PLDM_ERROR;
-		}
-		instanceID++;
 		if (cmd == PLDM_GET_PDR) {
 			pfPdrReq.recordHandle = pfPdrResp.nextRecordHandle;
 			pfPdrReq.dataTransferHandle = pfPdrResp.nextDataTransferHandle;
@@ -586,28 +563,28 @@ bool pldm::isFirmwareUpdateEnabled()
 
 	if (pfGetStateEffecterStates(kFwuEffecterId) != PLDM_SUCCESS) {
 		if (mStateEffecterResp.completionCode == PLDM_PLATFORM_INVALID_EFFECTER_ID) {
-			DBG("FWU: Effector ID {} not present on card {}; skipping enable check\n", kFwuEffecterId, mCardNum);
+			DBG("FWU: Effector ID {} not present on GPU {}; skipping enable check\n", kFwuEffecterId, mGpuBdf);
 			return true;
 		}
-		ERR("FWU: GetStateEffecterStates effector ID {} failed on card {}\n", kFwuEffecterId, mCardNum);
+		ERR("FWU: GetStateEffecterStates effector ID {} failed on GPU {}\n", kFwuEffecterId, mGpuBdf);
 		return false;
 	}
 
-	DBG("FWU: Firmware update enable effector ID {} presentValue={} effectorOpState={} on card {}\n", kFwuEffecterId,
-		mStateEffecterResp.presentValue, mStateEffecterResp.effecterOpState, mCardNum);
+	DBG("FWU: Firmware update enable effector ID {} presentValue={} effectorOpState={} on GPU {}\n", kFwuEffecterId,
+		mStateEffecterResp.presentValue, mStateEffecterResp.effecterOpState, mGpuBdf);
 
 	if (mStateEffecterResp.effecterOpState == PLDM_EFFECTER_ENABLED_UPDATEPENDING ||
 		mStateEffecterResp.effecterOpState == PLDM_EFFECTER_ENABLED_NOUPDATEPENDING) {
 		const uint8_t fwDisable = mStateEffecterResp.presentValue;
 		if (fwDisable == PLDM_EFFECTER_OPERATIONAL_VALUE_ENABLED) {
-			ERR("FWU: Firmware update is disabled (effector ID {} presentValue={}) on card {:02}; aborting\n",
-				kFwuEffecterId, fwDisable, mCardNum);
+			ERR("FWU: Firmware update is disabled (effector ID {} presentValue={}) on GPU {}; aborting\n",
+				kFwuEffecterId, fwDisable, mGpuBdf);
 			return false;
 		}
 	} else {
 		DBG("FWU: Effector state  is not valid. Ignoring effector present value for effector ID {} effecterOpState={} "
-			"on card {:02}\n",
-			kFwuEffecterId, mStateEffecterResp.effecterOpState, mCardNum);
+			"on GPU {}\n",
+			kFwuEffecterId, mStateEffecterResp.effecterOpState, mGpuBdf);
 	}
 	return true;
 }

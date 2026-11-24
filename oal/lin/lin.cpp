@@ -36,6 +36,7 @@
 #include "lin.h"
 #include "terminal.h"
 #include "pci_database.h"
+#include "pci_sysfs.h"
 #include "dmi_reader.h"
 #include "bdf.h"
 
@@ -1080,16 +1081,28 @@ std::string getKernelVersion()
  * driver package outright (e.g. "xeb_v7.1.4.31_260728.26"), which is what a reader
  * can act on.
  *
- * The in-tree driver declares no MODULE_VERSION and so has no release version.
- * Nothing is reported in that case and callers omit the value rather than
- * substituting something that names no release: neither the module's source
- * checksum nor the kernel release identifies a driver release.
+ * The in-tree driver declares no MODULE_VERSION and so has no release version, but
+ * it ships with the kernel, so the kernel's version identifies it. That is reported
+ * instead, shortened to its version and distro build number and marked as in-tree
+ * (e.g. "6.8.0-45 (in-tree)" for "6.8.0-45-generic"), so every caller presents the
+ * same value under the same "KMD Version" label. The build number stays because a
+ * distro backports driver code without changing the base version.
  *
  * @param bdf PCI BDF address of the device, or "" to use whichever Intel GPU module is loaded
- * @return std::string release version (e.g. "xeb_v7.1.4.31_260728.26"), or an empty
- *         string when the driver declares none
+ * @return std::string release version (e.g. "xeb_v7.1.4.31_260728.26"), the in-tree
+ *         kernel version (e.g. "6.8.0-45 (in-tree)"), or an empty string when the driver
+ *         cannot be identified
  */
-std::string getKernelDriverVersion(const std::string &bdf) { return getKernelDriverModuleVersion(bdf); }
+std::string getKernelDriverVersion(const std::string &bdf)
+{
+	if (std::string version = getKernelDriverModuleVersion(bdf); !version.empty()) {
+		return version;
+	}
+	if (std::string inTree = getInTreeKernelDriverVersion(bdf, getKernelVersion()); !inTree.empty()) {
+		return inTree.append(KMD_IN_TREE_SUFFIX);
+	}
+	return {};
+}
 
 /**
  * @brief Checks whether the current kernel matches the known-broken xe debug pattern.
@@ -1162,14 +1175,20 @@ bool sysmanEngineCountersAllowed() { return hasEnv("XPU_SMI_SYSMAN_ENGINE_UTIL")
  * 1. Read from sysfs /label attribute (fast path, rarely populated)
  * 2. Query SMBIOS/DMI tables via DmiReader (more reliable, works on most systems)
  *
- * @param[in] bdf PCI BDF address string in format "SSSS:BB:DD.F"
+ * @param[in]  bdf              PCI BDF address string in format "SSSS:BB:DD.F"
+ * @param[out] permissionDenied Optional; set to true only when the slot could not be looked up
+ *                              because the caller may not read the SMBIOS/DMI tables.
  * @return std::string PCI slot designation/label or empty string if not available
  *
  * @note SMBIOS lookup provides slot information on most systems where sysfs label is absent
  * @note DMI reader is instantiated on-demand and may require elevated permissions
  */
-std::string getPciSlotLabel(const std::string &bdf)
+std::string getPciSlotLabel(const std::string &bdf, bool *permissionDenied)
 {
+	if (permissionDenied != nullptr) {
+		*permissionDenied = false;
+	}
+
 	if (!isValidBdf(bdf)) {
 		ERR("Rejecting suspicious BDF address: {}\n", bdf.c_str());
 		return "";
@@ -1187,7 +1206,15 @@ std::string getPciSlotLabel(const std::string &bdf)
 		}
 	}
 
-	// Fallback to SMBIOS/DMI tables
+	// Fallback to SMBIOS/DMI tables, which are readable by root only
+	if (access("/sys/firmware/dmi/tables/DMI", R_OK) != 0 && (errno == EACCES || errno == EPERM)) {
+		DBG("Reading the SMBIOS slot of {} requires root privileges\n", bdf.c_str());
+		if (permissionDenied != nullptr) {
+			*permissionDenied = true;
+		}
+		return "";
+	}
+
 	try {
 		static DmiReader dmiReader; // Only read tables once
 
@@ -1373,6 +1400,23 @@ int getXeDevPciProps(std::vector<xeDevPciInfo> *pciPropsList)
 	}
 
 	return 0;
+}
+
+/**
+ * @brief List GPU BDFs in xpu-smi device-index order, without Level Zero
+ *
+ * See listLevelZeroGpus() for how the order is derived from sysfs.
+ *
+ * @param bdfList [out] Receives the BDFs; bdfList[i] is the GPU xpu-smi numbers as device i.
+ * @return int  Number of GPUs found (0 when none are)
+ */
+int getLevelZeroGpuOrder(std::vector<std::string> *bdfList)
+{
+	*bdfList = listLevelZeroGpus();
+	for (size_t i = 0; i < bdfList->size(); ++i) {
+		DBG("Device {}: {}\n", i, (*bdfList)[i].c_str());
+	}
+	return static_cast<int>(bdfList->size());
 }
 
 // Offset of Slot Capabilities register within the PCIe Capability structure

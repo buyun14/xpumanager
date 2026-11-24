@@ -15,6 +15,8 @@
 
 inline constexpr char DEVICE_STATE_SURV_MODE[] = "survivability mode";
 inline constexpr char DEVICE_STATE_NORMAL[] = "normal";
+// Shown for properties whose only data source is restricted to privileged users
+inline constexpr char NA_REQUIRES_ROOT[] = "N/A (Requires Root)";
 
 /**
  * @brief Discovery-specific text printer that formats discovery output as human-readable text
@@ -93,8 +95,6 @@ enum discDumpType
 	DUMP_PARTNUMBER,
 	DUMP_MEMORYTYPE,
 	DUMP_MEMORYVENDOR,
-	DUMP_MEMORYDATECODE,
-	DUMP_MEMORYICDIEINFO,
 	DUMP_KERNELDRIVERVERSION,
 	DUMP_TDP,
 	TOTAL_DISC_DUMPS
@@ -145,8 +145,6 @@ public:
 	ze_result_t memoryBusWidth(devInfo *d, std::string *outputLine);
 	ze_result_t memoryType(devInfo *d, std::string *outputLine);
 	ze_result_t memoryVendor(devInfo *d, std::string *outputLine);
-	ze_result_t memoryDateCode(devInfo *d, std::string *outputLine);
-	ze_result_t memoryIcDieInfo(devInfo *d, std::string *outputLine);
 	ze_result_t eus(devInfo *d, std::string *outputLine);
 	ze_result_t mediaEngines(devInfo *d, std::string *outputLine);
 	ze_result_t mediaEnhancementEngines(devInfo *d, std::string *outputLine);

@@ -77,7 +77,8 @@ ze_result_t resolveGfxFirmwareStatusForDevice(devInfo *d, std::string_view firmw
  * way, while each decides for itself how to present an absent version.
  *
  * @param[in] d Pointer to the device info structure
- * @return Release version, or an empty string when the driver declares none
+ * @return Release version, the in-tree kernel version (e.g. "6.8.0-45 (in-tree)"), or an
+ *         empty string when the driver cannot be identified
  */
 static std::string kmdVersionOf(devInfo *d)
 {
@@ -165,10 +166,8 @@ static const std::array<discoveryDumpStruct, TOTAL_DISC_DUMPS> DISC_DUMP_CMDS{{
 	{&cmdDiscovery::partNumber, "Part Number"},										 // 49
 	{&cmdDiscovery::memoryType, "Memory Type"},										 // 50
 	{&cmdDiscovery::memoryVendor, "Memory Vendor"},									 // 51
-	{&cmdDiscovery::memoryDateCode, "Memory Date Code"},							 // 52
-	{&cmdDiscovery::memoryIcDieInfo, "Memory IC/Die Info"},							 // 53
-	{&cmdDiscovery::kernelDriverVersion, "KMD Version"},							 // 54
-	{&cmdDiscovery::tdp, "Thermal Design Power"},									 // 55
+	{&cmdDiscovery::kernelDriverVersion, "KMD Version"},							 // 52
+	{&cmdDiscovery::tdp, "Thermal Design Power"},									 // 53
 }};
 /**
  * @brief Helper function to convert internal JSON keys to user-friendly display names
@@ -206,8 +205,6 @@ std::string getDisplayName(const std::string &key)
 		{"memory_bus_width", "Memory Bus Width"},
 		{"memory_type", "Memory Type"},
 		{"memory_vendor", "Memory Vendor"},
-		{"memory_date_code", "Memory Date Code"},
-		{"memory_ic_die_info", "Memory IC/Die Info"},
 		{"number_of_eus", "Number of EUs"},
 		{"number_of_media_engines", "Number of Media Engines"},
 		{"number_of_media_enh_engines", "Number of Media Enhancement Engines"},
@@ -272,7 +269,7 @@ void DiscoveryTextPrinter::print(nlohmann::ordered_json *jsonObj)
 		if (val.is_number_integer() && val.get<int64_t>() == -1) {
 			return "N/A";
 		}
-		return val.dump();
+		return jsonText(val);
 	};
 	auto buildCsvLine = [&](const nlohmann::ordered_json &cells) -> std::string {
 		std::string line;
@@ -396,8 +393,6 @@ void DiscoveryTextPrinter::print(nlohmann::ordered_json *jsonObj)
 		addField("memory_type", "Memory Type");
 		addField("memory_physical_size", "Memory Physical Size");
 		addField("memory_vendor", "Memory Vendor");
-		addField("memory_date_code", "Memory Date Code");
-		addField("memory_ic_die_info", "Memory IC/Die Info");
 		if (jsonObj->contains("max_mem_alloc_size_byte")) {
 			uint64_t maxAllocBytes = 0;
 			std::string bytesStr = valueToString((*jsonObj)["max_mem_alloc_size_byte"]);
@@ -769,8 +764,11 @@ ze_result_t cmdDiscovery::gatherDeviceProperties(devInfo *d, DeviceProperties &p
 		partNumber(d, &outputLine);
 		props["part_number"] = outputLine;
 
-		if (queryTdpFromAMC(d, &outputLine) == ZE_RESULT_SUCCESS) {
+		const auto tdpResult = queryTdpFromAMC(d, &outputLine);
+		if (tdpResult == ZE_RESULT_SUCCESS) {
 			props["tdp"] = outputLine;
+		} else if (tdpResult == ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS) {
+			props["tdp"] = NA_REQUIRES_ROOT;
 		}
 	}
 
@@ -877,19 +875,16 @@ ze_result_t cmdDiscovery::gatherDeviceProperties(devInfo *d, DeviceProperties &p
 	props["memory_physical_size"] = xpum::compat::format("{:.2f} MiB", physicalSizeMiB);
 	props["memory_physical_size_byte"] = std::to_string(physicalSize);
 
-	// Fine-grained video memory specification, collected in one call. The keys are
-	// written even when collection fails: a device that reports no memory source
-	// still has these properties, they are just unknown, and dropping the keys
-	// would make the JSON shape depend on the device.
+	// Fine-grained video memory specification. The key is written even when
+	// collection fails: a device that reports no memory source still has the
+	// property, it is just unknown, and dropping the key would make the JSON
+	// shape depend on the device.
 	MemorySpecData memSpec;
 	if (const auto specResult = m->getMemorySpec(d->deviceHdl, memSpec); specResult != ZE_RESULT_SUCCESS) {
 		DBG("Memory specification unavailable: 0x{:X} ({})\n", specResult, l0_error_to_string(specResult));
 	}
 	props["memory_type"] = memSpec.typeName;
-	// memory_vendor is set from the real vendor-ID sysman extension above (memoryVendor()),
-	// not from memSpec.vendor which has no platform source and is always "unknown".
-	props["memory_date_code"] = memSpec.dateCode;
-	props["memory_ic_die_info"] = memSpec.dieInfo;
+	// memory_vendor is set above by memoryVendor() from the memory vendor sysman extension.
 
 	pciVendorID(d, &outputLine);
 	props["pci_vendor_id"] = outputLine;
@@ -1084,7 +1079,12 @@ ze_result_t cmdDiscovery::serialNumber(devInfo *d, std::string *outputLine)
 {
 	TRACING();
 
-	return querySerialNumber(*d, *outputLine);
+	bool permissionDenied = false;
+	const auto result = querySerialNumber(*d, *outputLine, &permissionDenied);
+	if (result == ZE_RESULT_SUCCESS && *outputLine == UNKNOWN_SERIAL && permissionDenied) {
+		*outputLine = NA_REQUIRES_ROOT;
+	}
+	return result;
 }
 
 /**
@@ -1278,7 +1278,12 @@ ze_result_t cmdDiscovery::pciSlot(devInfo *d, std::string *outputLine)
 		return ZE_RESULT_SUCCESS;
 	}
 
-	*outputLine = GETPCISLOTLABEL(p->getBDFStr());
+	bool permissionDenied = false;
+	*outputLine = GETPCISLOTLABEL(p->getBDFStr(), &permissionDenied);
+	// Without a sysfs label the slot comes from the SMBIOS tables, which only root can read
+	if (outputLine->empty() && permissionDenied) {
+		*outputLine = NA_REQUIRES_ROOT;
+	}
 	return ZE_RESULT_SUCCESS;
 }
 
@@ -1509,46 +1514,6 @@ ze_result_t cmdDiscovery::memoryVendor(devInfo *d, std::string *outputLine)
 }
 
 /**
- * @brief Prints the memory date code for a device when user runs discovery --dump 52.
- *
- * No interface in the software stack exposes the memory date code, so this is
- * "unknown" on every platform today; see MemorySpecData in hal/core/memory.h.
- *
- * @param[in] d Pointer to the device info structure (unused)
- * @param[out] outputLine Pointer to the output line string
- *
- * @retval ZE_RESULT_SUCCESS Always succeeds
- */
-// Bound as a pointer-to-member in DISC_DUMP_CMDS, so it cannot be static.
-// NOLINTNEXTLINE(readability-convert-member-functions-to-static)
-ze_result_t cmdDiscovery::memoryDateCode(UNUSED devInfo *d, std::string *outputLine)
-{
-	TRACING(); // NOLINT(misc-const-correctness)
-	*outputLine = MEMORY_SPEC_UNKNOWN;
-	return ZE_RESULT_SUCCESS;
-}
-
-/**
- * @brief Prints the memory IC/die information when user runs discovery --dump 53.
- *
- * No interface in the software stack exposes memory IC/die data, so this is
- * "unknown" on every platform today; see MemorySpecData in hal/core/memory.h.
- *
- * @param[in] d Pointer to the device info structure (unused)
- * @param[out] outputLine Pointer to the output line string
- *
- * @retval ZE_RESULT_SUCCESS Always succeeds
- */
-// Bound as a pointer-to-member in DISC_DUMP_CMDS, so it cannot be static.
-// NOLINTNEXTLINE(readability-convert-member-functions-to-static)
-ze_result_t cmdDiscovery::memoryIcDieInfo(UNUSED devInfo *d, std::string *outputLine)
-{
-	TRACING(); // NOLINT(misc-const-correctness)
-	*outputLine = MEMORY_SPEC_UNKNOWN;
-	return ZE_RESULT_SUCCESS;
-}
-
-/**
  * @brief Prints the EUs for a device when user runs discovery --dump 19.
  *
  * @param[in] d Pointer to the device info structure
@@ -1641,6 +1606,13 @@ ze_result_t cmdDiscovery::mediaEngines(devInfo *d, std::string *outputLine)
 		return result;
 	}
 
+	// Sysman exposes no engine at all when the engine PMU cannot be opened (non-root):
+	// the count is unknown, not zero.
+	if (engineGroup->getEngineGroupCount() == 0 && !PRIVILEGECHECK()) {
+		*outputLine = NA_REQUIRES_ROOT;
+		return ZE_RESULT_SUCCESS;
+	}
+
 	*outputLine = std::to_string(mediaEnginesCount);
 	return ZE_RESULT_SUCCESS;
 }
@@ -1673,6 +1645,13 @@ ze_result_t cmdDiscovery::mediaEnhancementEngines(devInfo *d, std::string *outpu
 	if (result != ZE_RESULT_SUCCESS) {
 		ERR("Failed to get media engines count: 0x{:X} ({})\n", result, l0_error_to_string(result));
 		return result;
+	}
+
+	// Sysman exposes no engine at all when the engine PMU cannot be opened (non-root):
+	// the count is unknown, not zero.
+	if (engineGroup->getEngineGroupCount() == 0 && !PRIVILEGECHECK()) {
+		*outputLine = NA_REQUIRES_ROOT;
+		return ZE_RESULT_SUCCESS;
 	}
 
 	*outputLine = std::to_string(mediaEnhancementEnginesCount);
@@ -2067,7 +2046,7 @@ ze_result_t cmdDiscovery::kernelVersion(UNUSED devInfo *d, std::string *outputLi
 }
 
 /**
- * @brief Prints the kernel-mode driver version for a device when user runs discovery --dump 54.
+ * @brief Prints the kernel-mode driver version for a device when user runs discovery --dump 52.
  *
  * Complements UMD Version (dump 8), which reports the Level Zero user-mode
  * driver. This is the KMD's release version -- the `version` field of
@@ -2075,10 +2054,10 @@ ze_result_t cmdDiscovery::kernelVersion(UNUSED devInfo *d, std::string *outputLi
  * carries and which names the driver package outright
  * (e.g. "xeb_v7.1.4.31_260728.26").
  *
- * The in-tree driver declares no MODULE_VERSION and so has no release version,
- * and Windows exposes none at all. The column is requested explicitly here, so it
- * is spelled "N/A" rather than dropped; the text and JSON views omit the field
- * instead.
+ * The in-tree driver declares no MODULE_VERSION, so the kernel's version is
+ * reported for it instead (e.g. "6.8.0-45 (in-tree)"). Windows exposes neither. The
+ * column is requested explicitly here, so an unknown version is spelled "N/A"
+ * rather than dropped; the text and JSON views omit the field instead.
  *
  * @param[in] d Pointer to the device info structure
  * @param[out] outputLine Pointer to the output line string (release version or "N/A")
@@ -2249,7 +2228,11 @@ ze_result_t cmdDiscovery::amcFirmwareVersion(devInfo *d, std::string *outputLine
 	char version[MAX_PATH] = {0};
 	pci *p = d->dev->getPCI();
 	firmware *fw = d->dev->getFirmware();
-	fw->getFWversion(fwType::AMC, p->getBDFStr().c_str(), version, sizeof(version));
+	if (fw->getFWversion(fwType::AMC, p->getBDFStr().c_str(), version, sizeof(version)) ==
+		ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS) {
+		*outputLine = NA_REQUIRES_ROOT;
+		return ZE_RESULT_SUCCESS;
+	}
 	*outputLine = version;
 	return ZE_RESULT_SUCCESS;
 }
@@ -2322,7 +2305,7 @@ ze_result_t cmdDiscovery::opromCodeFirmwareVersion(devInfo *d, std::string *outp
 	gscupd gsc;
 	int ret = gsc.getOpromVersion(p->getBDFStr().c_str(), IGSC_OPROM_CODE, version.data(), version.size());
 	if (ret != 0) {
-		*outputLine = "";
+		*outputLine = (ret == IGSC_ERROR_PERMISSION_DENIED) ? NA_REQUIRES_ROOT : "";
 		return ZE_RESULT_SUCCESS;
 	}
 
@@ -2373,7 +2356,7 @@ ze_result_t cmdDiscovery::opromDataFirmwareVersion(devInfo *d, std::string *outp
 	gscupd gsc;
 	int ret = gsc.getOpromVersion(p->getBDFStr().c_str(), IGSC_OPROM_DATA, version.data(), version.size());
 	if (ret != 0) {
-		*outputLine = "";
+		*outputLine = (ret == IGSC_ERROR_PERMISSION_DENIED) ? NA_REQUIRES_ROOT : "";
 		return ZE_RESULT_SUCCESS;
 	}
 
@@ -2391,7 +2374,7 @@ ze_result_t cmdDiscovery::opromDataFirmwareVersion(devInfo *d, std::string *outp
 }
 
 /**
- * @brief Prints Thermal Design Power (TDP) for a device when user runs discovery --dump 55
+ * @brief Prints Thermal Design Power (TDP) for a device when user runs discovery --dump 53.
  *
  * TDP is read from the AMC FRU OTHER_INFORMATION field per DSP0257.
  *
@@ -2414,6 +2397,8 @@ ze_result_t cmdDiscovery::tdp(devInfo *d, std::string *outputLine)
 	const auto result = queryTdpFromAMC(d, &tdpStr);
 	if (result == ZE_RESULT_SUCCESS && !tdpStr.empty()) {
 		*outputLine = tdpStr;
+	} else if (result == ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS) {
+		*outputLine = NA_REQUIRES_ROOT;
 	} else {
 		DBG("TDP not available for device {} (result: 0x{:X})\n", d->dev->getPCI()->getBDFStr().c_str(), result);
 	}
@@ -2441,12 +2426,17 @@ ze_result_t cmdDiscovery::listamcversions(devInfo *d, nlohmann::ordered_json *js
 	auto *const p = d->dev->getPCI();
 	auto *const fw = d->dev->getFirmware();
 
-	fw->getFWversion(fwType::AMC, p->getBDFStr().c_str(), version.data(), static_cast<uint32_t>(version.size()));
+	const auto result =
+		fw->getFWversion(fwType::AMC, p->getBDFStr().c_str(), version.data(), static_cast<uint32_t>(version.size()));
 	// Record the device ID alongside the version so the text printer can show it.
 	(*jsonObj)["device_id"].push_back(d->index);
 	// Wrap the versions in the documented object shape
 	// ({"amc_firmware_version": [...]}) instead of emitting a bare JSON array.
-	(*jsonObj)["amc_firmware_version"].push_back(version.data());
+	if (result == ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS) {
+		(*jsonObj)["amc_firmware_version"].push_back(NA_REQUIRES_ROOT);
+	} else {
+		(*jsonObj)["amc_firmware_version"].push_back(version.data());
+	}
 
 	return ZE_RESULT_SUCCESS;
 }
@@ -2458,6 +2448,7 @@ ze_result_t cmdDiscovery::listamcversions(devInfo *d, nlohmann::ordered_json *js
  * @param[out] partNumberString  Populated with the FRU part number on success.
  *
  * @retval ZE_RESULT_SUCCESS             Part number retrieved and stored in partNumberString.
+ * @retval ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS The caller cannot access the AMC devices.
  * @retval ZE_RESULT_ERROR_UNINITIALIZED No AMC present, firmware object unavailable, or retrieval failed.
  */
 ze_result_t cmdDiscovery::queryPartNumberFromAMC(devInfo *d, std::string *partNumberString)
@@ -2480,7 +2471,7 @@ ze_result_t cmdDiscovery::queryPartNumberFromAMC(devInfo *d, std::string *partNu
 	if (result != ZE_RESULT_SUCCESS || partNum[0] == '\0') {
 		DBG("Failed to get part number from AMC for device {} (result: 0x{:X})\n",
 			d->dev->getPCI()->getBDFStr().c_str(), result);
-		return ZE_RESULT_ERROR_UNINITIALIZED;
+		return (result == ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS) ? result : ZE_RESULT_ERROR_UNINITIALIZED;
 	}
 
 	*partNumberString = partNum;
@@ -2509,9 +2500,12 @@ ze_result_t cmdDiscovery::partNumber(devInfo *d, std::string *outputLine)
 		return ZE_RESULT_SUCCESS;
 	}
 	std::string partNumFromAMC;
-	if (queryPartNumberFromAMC(d, &partNumFromAMC) == ZE_RESULT_SUCCESS && !partNumFromAMC.empty()) {
+	const auto result = queryPartNumberFromAMC(d, &partNumFromAMC);
+	if (result == ZE_RESULT_SUCCESS && !partNumFromAMC.empty()) {
 		DBG("Successfully retrieved part number from AMC: {}\n", partNumFromAMC.c_str());
 		*outputLine = partNumFromAMC;
+	} else if (result == ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS) {
+		*outputLine = NA_REQUIRES_ROOT;
 	}
 
 	return ZE_RESULT_SUCCESS;
@@ -2525,6 +2519,7 @@ ze_result_t cmdDiscovery::partNumber(devInfo *d, std::string *outputLine)
  *
  * @retval ZE_RESULT_SUCCESS TDP successfully retrieved from AMC FRU data
  * @retval ZE_RESULT_ERROR_UNINITIALIZED No AMC present or AMC not initialized
+ * @retval ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS The caller cannot access the AMC devices
  * @retval ZE_RESULT_ERROR_NOT_AVAILABLE TDP not found in FRU OTHER_INFORMATION
  */
 ze_result_t cmdDiscovery::queryTdpFromAMC(devInfo *d, std::string *tdpString)
@@ -2542,20 +2537,12 @@ ze_result_t cmdDiscovery::queryTdpFromAMC(devInfo *d, std::string *tdpString)
 		return ZE_RESULT_ERROR_UNINITIALIZED;
 	}
 
-	char tdpBuf[MAX_PATH] = {};
-	size_t bufferSize = sizeof(tdpBuf);
-	ze_result_t result = fw->getAmcTdp(d->dev->getPCI()->getBDFStr().c_str(), tdpBuf, &bufferSize);
-	if (result != ZE_RESULT_SUCCESS || tdpBuf[0] == '\0') {
+	uint32_t tdpWatts = 0;
+	ze_result_t result = fw->getAmcTdpWatts(d->dev->getPCI()->getBDFStr().c_str(), &tdpWatts);
+	if (result != ZE_RESULT_SUCCESS) {
 		DBG("TDP not available from AMC for device {} (result: 0x{:X})\n", d->dev->getPCI()->getBDFStr().c_str(),
 			result);
-		return ZE_RESULT_ERROR_NOT_AVAILABLE;
-	}
-
-	uint32_t tdpWatts = 0;
-	const auto [ptr, ec] = std::from_chars(tdpBuf, tdpBuf + strlen(tdpBuf), tdpWatts, 16);
-	if (ec != std::errc{} || *ptr != '\0') {
-		DBG("Invalid hexadecimal TDP '{}' from AMC FRU\n", tdpBuf);
-		return ZE_RESULT_ERROR_NOT_AVAILABLE;
+		return (result == ZE_RESULT_ERROR_INSUFFICIENT_PERMISSIONS) ? result : ZE_RESULT_ERROR_NOT_AVAILABLE;
 	}
 
 	*tdpString = std::to_string(tdpWatts) + " W";
